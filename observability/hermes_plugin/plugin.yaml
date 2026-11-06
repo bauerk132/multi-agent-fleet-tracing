@@ -1,0 +1,10 @@
+# NOT VERIFIED — DO NOT INSTALL.
+# Staged documentation example only (Milestone 1).
+# The Hermes plugin contract (manifest syntax, register(ctx) signature,
+# hook names, payload fields, CLI commands, installed version) is
+# UNVERIFIED against any installed Hermes build. Milestone 3 validates
+# it against the exact tagged release and the locally installed version
+# before anything is shipped. Fallback until then: external agent.handoff.
+name: fleet-trace-observer
+version: 0.1.0
+description: "UNVERIFIED STUB — read-only observer plugin sketch, not installable."

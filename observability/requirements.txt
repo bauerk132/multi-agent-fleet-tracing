@@ -1,0 +1,6 @@
+# Milestone 1 pins — verified to exist on PyPI.
+# The local receiver speaks OTLP/HTTP JSON; the pinned proto-http
+# (protobuf) exporter is installed for use against a real OTLP collector.
+opentelemetry-api==1.45.1
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1
