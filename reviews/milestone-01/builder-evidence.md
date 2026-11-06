@@ -7,7 +7,7 @@
 **Date:** 2026-11-06
 **Builder:** Muse (implementation agent)
 
-> **Scope note for reviewers:** the GitHub snapshot commit `cf888dc9` (pushed 2026-11-06) contains Milestone 1 **and** Milestone 2 files together in one commit, because the connector snapshot push uploads the whole tree. Milestone 1-only review must use local commit `9a2a97a`. Milestone 2's harness (`observability/claude_child.py`, `observability/tests/test_claude_child.py`, plus small `receiver.py`/`README.md` changes) lives in the later local commit `d98289f` and is **not** part of this Milestone 1 candidate. The Milestone 2 harness was built before the G1/G2 protocol arrived, on Kyle's direct instruction to move to Milestone 2; no further Milestone 2 changes are being made while Milestone 1's gates are outstanding.
+> **Scope note for reviewers:** the GitHub snapshot commit `cf888dc9` (pushed 2026-11-06) contains Milestone 1 **and** Milestone 2 files together in one commit, because the connector snapshot push uploads the whole tree. Milestone 1-only review must use local commit `9a2a97a`. Milestone 2's harness (`observability/claude_child.py`, `observability/tests/test_claude_child.py`, plus small `receiver.py`/`README.md` changes) lives in the later local commit `d98289f` and is **not** part of this Milestone 1 candidate. The Milestone 2 harness was built before the G1/G2 protocol arrived, on Kyle's direct instruction to move to Milestone 2; no further Milestone 2 changes are being made while Milestone 1's gates are outstanding. **Exception:** Fix Round 1 (commit `25643e8`) did change the M2 harness (`claude_child.py` path resolution) because the Antigravity review's M2 findings required it — see `fix-rounds.md`.
 
 ## 1. What was built (commit 9a2a97a, 15 files, +1948 lines)
 
@@ -100,12 +100,34 @@ Receiver on `http://127.0.0.1:4318/v1/traces`; coordinator run, then fixture exp
 
 ## 7. Gate status
 
-- **G1 status:** NOT STARTED — awaiting the designated G1 reviewer (ChatGPT, Project Coordination).
-- **G2 status:** NOT STARTED — Antigravity is the designated G2 reviewer. Note: Antigravity is currently running a review of Milestones 1 and 2, but per this protocol G2 begins only after G1 PASS and must review the exact G1-approved commit. Its current review is therefore a pre-review; it must be re-run (or confirmed) against the G1-approved commit before it can count as G2.
-- **Milestone 1 acceptance:** NOT DECLARED. "Built and passing" is a builder claim, not acceptance.
-- **Next required action:** G1 reviewer verifies this packet (rerun §2–§4, check §5–§6) and records a PASS/FAIL/BLOCKED verdict in `g1-verification.md`.
+- **Antigravity review RECEIVED 2026-11-06** (HiveMind handoff
+  `hof_01M6RNMAQA9H660H2D`): M1 **FAIL** (blocked by missing repository
+  artifacts — the code was never staged on the laptop, so test claims were
+  uncorroborated from its side); M2 **NEEDS CHANGES** (Claude Code 2.1.318
+  natively supports OTel and accepts TRACEPARENT in `claude -p`/SDK, with
+  5 prerequisites). Full report pasted to the builder by Kyle.
+- **Reviewer rule (Kyle, 2026-11-06):** the reviewer just needs to be
+  different from the builder, so Antigravity covering both G1 and G2 is
+  acceptable. No separate G1 reviewer is required.
+- **Fix Round 1 DONE** — see `fix-rounds.md` (commit `25643e8`, 9 new
+  tests, 27 run / 26 passed / 1 skipped). Builder claims Implemented +
+  Tested only.
+- **Milestone 1 acceptance:** NOT DECLARED.
+- **Next required action:** Antigravity re-reviews commit `25643e8` from a
+  laptop clone (see the re-review handoff in HiveMind) and records new
+  verdicts in `g1-verification.md` / `g2-independent-review.md`.
 
 ## 8. Status vocabulary (Engineering Quality & Security Standards §2)
 
 - **Implemented** — code exists. **Tested** — the test was actually executed. **Verified** — someone independently reproduced the evidence. **Accepted** — the required review gates passed.
 - This packet claims **Implemented** and **Tested** only (11/11, re-run by the builder for this packet). **Verified** is G1's job; **Accepted** requires both gates. The builder does not review its own work and awards no G1 or G2 approval.
+
+## 9. Fix Round 1 (2026-11-06, commit `25643e8`)
+
+Antigravity's review (M1 FAIL / M2 NEEDS CHANGES) was answered in
+`fix-rounds.md`: 15 findings, 6 fixed in code (signal handlers, 256-char
+guard, traceparent regex, claude.exe resolution, span-link case, offline
+test runner), 9 verified already-handled in code with existing regression
+tests. Suite grew to **27 run, 26 passed, 1 skipped** (live-Claude test),
+re-run via `python3 scripts/run_offline_tests.py`. The fix-round commit is
+pushed to GitHub; Antigravity re-reviews it from a laptop clone.
