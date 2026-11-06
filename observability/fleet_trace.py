@@ -195,9 +195,16 @@ def _install_signal_handlers(provider):
     and re-sends the signal so the process still terminates with the
     original signal semantics. No-ops outside the main thread and on
     platforms where a signal cannot be caught.
+
+    Fix Round 2: on Windows, os.kill/SIGTERM terminates the process
+    via TerminateProcess, which bypasses Python signal handlers, so
+    the SIGTERM-flush path is POSIX-only there; the handler is still
+    registered (and directly testable), and atexit + explicit
+    shutdown remain the Windows guarantees. Returns the handler so
+    tests can invoke it directly with os.kill patched.
     """
     if threading.current_thread() is not threading.main_thread():
-        return
+        return None
 
     def _handler(signum, _frame):
         _flush_quietly(provider)
@@ -216,6 +223,7 @@ def _install_signal_handlers(provider):
             signal.signal(sig, _handler)
         except (ValueError, OSError, RuntimeError):
             pass
+    return _handler
 
 
 def init_tracing(endpoint, service_name):

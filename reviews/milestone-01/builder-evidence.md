@@ -112,10 +112,24 @@ Receiver on `http://127.0.0.1:4318/v1/traces`; coordinator run, then fixture exp
 - **Fix Round 1 DONE** — see `fix-rounds.md` (commit `25643e8`, 9 new
   tests, 27 run / 26 passed / 1 skipped). Builder claims Implemented +
   Tested only.
+- **Antigravity re-review of Fix Round 1 RECEIVED 2026-11-06** (HiveMind
+  handoff `hof_01M6SFABQNEAVFCX3R`, update 22:27 UTC; episode memory
+  `mem_01M6SFJPE0GSWQXRK3`): staging commit `dad1d48` — physical
+  staging **PASSED**, security/privacy controls **VERIFIED**, but the
+  offline suite failed **10 of 27 on the Windows host** (stub extension,
+  env-allowlist keys, SIGTERM exit code, SystemRoot). Verdict: **FIX
+  ROUND 2 REQUIRED**. Detailed reports live on the laptop only
+  (`reviews/milestone-01/g1-verification.md`,
+  `g2-independent-review.md`); they were not pushed to GitHub.
+- **Fix Round 2 DONE** — see `fix-rounds.md` (1 new test, 28 run / 27
+  passed / 1 skipped). Builder claims Implemented + Tested only.
+  Windows-side behavior verified by reasoning + the reviewer's Windows
+  run, not by executing the suite on Windows on this VM.
 - **Milestone 1 acceptance:** NOT DECLARED.
-- **Next required action:** Antigravity re-reviews commit `25643e8` from a
-  laptop clone (see the re-review handoff in HiveMind) and records new
-  verdicts in `g1-verification.md` / `g2-independent-review.md`.
+- **Next required action:** Antigravity re-reviews the Fix Round 2
+  commit from a laptop clone (see the re-review handoff in HiveMind)
+  and records new verdicts in `g1-verification.md` /
+  `g2-independent-review.md`.
 
 ## 8. Status vocabulary (Engineering Quality & Security Standards §2)
 
@@ -131,3 +145,18 @@ test runner), 9 verified already-handled in code with existing regression
 tests. Suite grew to **27 run, 26 passed, 1 skipped** (live-Claude test),
 re-run via `python3 scripts/run_offline_tests.py`. The fix-round commit is
 pushed to GitHub; Antigravity re-reviews it from a laptop clone.
+
+## 10. Fix Round 2 (2026-11-06)
+
+Antigravity's re-review of staging `dad1d48` (17 passed / 10 failed on
+Windows) was answered in `fix-rounds.md`: 4 findings, all Windows test
+harness compatibility — platform-aware M2 stub (`claude.cmd` + `claude.py`
+on Windows), case-insensitive env-allowlist assertion with an explicit
+Windows-only allowance, SystemRoot in hand-built child envs, and a
+POSIX-only subprocess SIGTERM test with a directly-tested handler.
+Suite grew to **28 run, 27 passed, 1 skipped** (live-Claude test),
+re-run via `python3 scripts/run_offline_tests.py`. One production-code
+change only: `_install_signal_handlers` returns the handler it registered
+(testability). Windows-side behavior is verified by reasoning + the
+reviewer's Windows run, not by executing the suite on Windows here;
+the laptop re-review is the Windows verification step.
