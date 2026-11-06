@@ -18,7 +18,8 @@ and classifies the outcome from what the local receiver actually got:
                parented to a different span (context propagated, wrong
                parent). Reported as NOT handoff-parented.
   UNVERIFIED — no claude spans arrived at the receiver at all.
-  SKIPPED    — `claude` binary not found on PATH.
+  SKIPPED    — `claude` binary not resolvable (PATH, FLEET_CLAUDE_PATH
+               env override, or VS Code extension install).
   ERROR      — the child exited non-zero or timed out.
 
 Native OTel export alone does NOT prove inbound W3C support: only the
@@ -38,12 +39,14 @@ carries only safe generic error metadata, as in Milestone 1.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from opentelemetry import propagate, trace
 from opentelemetry.trace import (
@@ -81,6 +84,36 @@ DEFAULT_PROMPT = "Reply with exactly: OK"
 CLAUDE_SERVICE_NAME = "claude-code"
 _STDOUT_TAIL_CHARS = 500
 
+# Fix Round 1 (M2-P1-01): the `claude` binary is not on PATH on the dev
+# machine; it ships inside the VS Code extension. Resolution order:
+#   1. FLEET_CLAUDE_PATH env override (explicit absolute path)
+#   2. `claude` on PATH
+#   3. VS Code extension install under ~/.vscode/extensions (newest first)
+CLAUDE_PATH_ENV_VAR = "FLEET_CLAUDE_PATH"
+
+
+def resolve_claude_path():
+    """Find the `claude` binary. Returns the path string or None."""
+    override = os.environ.get(CLAUDE_PATH_ENV_VAR, "").strip()
+    if override and os.path.isfile(override):
+        return override
+    on_path = shutil.which("claude")
+    if on_path:
+        return on_path
+    pattern = str(
+        Path.home()
+        / ".vscode"
+        / "extensions"
+        / "anthropic.claude-code-*-win32-arm64"
+        / "resources"
+        / "native-binary"
+        / "claude.exe"
+    )
+    candidates = sorted(glob.glob(pattern))
+    if candidates:
+        return candidates[-1]
+    return None
+
 
 def claude_available():
     """Check for a `claude` binary and its version.
@@ -89,7 +122,7 @@ def claude_available():
     A missing binary is a skip, not a crash. A binary whose --version
     fails is still reported as installed with version None.
     """
-    path = shutil.which("claude")
+    path = resolve_claude_path()
     if not path:
         return {
             "installed": False,
@@ -140,14 +173,16 @@ def build_claude_child_env(carrier, task_id, session_id, handoff_ref, endpoint,
     return env
 
 
-def launch_claude(prompt, child_env, timeout=120, extra_args=None):
+def launch_claude(prompt, child_env, timeout=120, extra_args=None, claude_path=None):
     """Run `claude -p <prompt>` with the given env. Returns a report dict.
 
     Raw output is bounded to a 500-char tail and never placed on a span.
     Non-zero exit / timeout / spawn failure -> ok False with a bounded
-    error enum (ChildProcessFailure or Timeout).
+    error enum (ChildProcessFailure or Timeout). The binary is the
+    resolved path when given, else resolve_claude_path(), else "claude".
     """
-    cmd = ["claude", "-p", prompt] + list(extra_args or [])
+    binary = claude_path or resolve_claude_path() or "claude"
+    cmd = [binary, "-p", prompt] + list(extra_args or [])
     try:
         proc = subprocess.run(
             cmd, env=child_env, capture_output=True, text=True, timeout=timeout
@@ -335,7 +370,8 @@ def run_claude_intent(prompt, endpoint=None, receiver=None,
                 carrier, task_id, session_id, handoff_ref, endpoint
             )
             launch = launch_claude(
-                prompt, child_env, timeout=timeout, extra_args=claude_extra_args
+                prompt, child_env, timeout=timeout, extra_args=claude_extra_args,
+                claude_path=info["path"],
             )
             result["child_returncode"] = launch.get("returncode")
             result["child_stdout_tail"] = launch.get("stdout_tail")

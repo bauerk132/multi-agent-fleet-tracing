@@ -19,6 +19,7 @@ import tempfile
 import unittest
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -28,6 +29,7 @@ from claude_child import (
     claude_available,
     detect_parenting,
     launch_claude,
+    resolve_claude_path,
     run_claude_intent,
 )
 from receiver import LocalReceiver
@@ -125,8 +127,8 @@ if __name__ == "__main__":
 
 
 def _real_claude_on_path():
-    """True only if a NON-stub `claude` binary is on the real PATH."""
-    path = shutil.which("claude")
+    """True only if a NON-stub `claude` binary is resolvable."""
+    path = resolve_claude_path()
     if not path:
         return False
     try:
@@ -248,6 +250,42 @@ class ClaudeChildTestCase(unittest.TestCase):
             {s["attributes"].get("task.id") for s in spans},
             {"task-unparented-1", "task-unparented-2"},
         )
+
+    # -- claude path resolution (Fix Round 1, M2-P1-01) ----------------------
+    def test_resolve_claude_path_env_override(self):
+        fake = self.tmpdir / "my-claude"
+        fake.write_text("#!/bin/sh\necho fake\n")
+        fake.chmod(0o755)
+        os.environ["FLEET_CLAUDE_PATH"] = str(fake)
+        self.assertEqual(resolve_claude_path(), str(fake))
+        info = claude_available()
+        self.assertTrue(info["installed"])
+        self.assertEqual(info["path"], str(fake))
+
+    def test_resolve_claude_path_prefers_path(self):
+        # The stub on PATH (setUp) wins over any extension install.
+        self.assertEqual(resolve_claude_path(), str(self.bindir / "claude"))
+
+    def test_resolve_claude_path_missing(self):
+        with mock.patch.dict(os.environ, {"PATH": str(self.tmpdir)}):
+            os.environ.pop("FLEET_CLAUDE_PATH", None)
+            with mock.patch("claude_child.glob.glob", return_value=[]):
+                self.assertIsNone(resolve_claude_path())
+                info = claude_available()
+                self.assertFalse(info["installed"])
+                self.assertIsNone(info["path"])
+
+    def test_launch_claude_uses_env_override_path(self):
+        # Stub is NOT on PATH here; the env override must still find it.
+        os.environ["FLEET_CLAUDE_PATH"] = str(self.bindir / "claude")
+        os.environ["PATH"] = self._saved_env.get("PATH", "")
+        env = build_claude_child_env(
+            {}, "task-override-1", "session-override-1",
+            "payload:override-1", self.endpoint,
+        )
+        launch = launch_claude("Reply with exactly: OK", env)
+        self.assertTrue(launch["ok"], f"launch failed: {launch}")
+        self.assertEqual(len(self._claude_spans()), 1)
 
     # -- non-zero exit -> error, safe generic metadata, no span leak ---------
     def test_stub_claude_nonzero_exit(self):

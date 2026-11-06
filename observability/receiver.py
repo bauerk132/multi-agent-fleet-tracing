@@ -72,6 +72,14 @@ def flatten_payload(payload):
                         "startTimeUnixNano": span.get("startTimeUnixNano"),
                         "endTimeUnixNano": span.get("endTimeUnixNano"),
                         "attributes": _attrs_to_dict(span.get("attributes")),
+                        "links": [
+                            {
+                                "traceId": link.get("traceId"),
+                                "spanId": link.get("spanId"),
+                                "attributes": _attrs_to_dict(link.get("attributes")),
+                            }
+                            for link in (span.get("links") or [])
+                        ],
                         "status": {
                             "code": status.get("code", 0),
                             "message": status.get("message"),
