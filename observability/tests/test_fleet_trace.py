@@ -26,6 +26,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -35,6 +36,7 @@ from fleet_trace import (
     ALLOWED_CHILD_ENV,
     MAX_ATTRIBUTE_CHARS,
     TRACE_ENV_VARS,
+    _install_signal_handlers,
     build_child_env,
     init_tracing,
     run_intent,
@@ -48,6 +50,22 @@ CHILD_PATH = HERE / "child.py"
 
 FAKE_SECRET = "FAKE-SECRET-123"
 FAKE_TOKEN = "tok-fake-456"
+
+
+def _child_env_base():
+    """Minimal env for hand-built child spawns.
+
+    On Windows the Python interpreter cannot start without SystemRoot
+    (it locates system DLLs through it), so it is included when
+    present in the parent env. On POSIX it is absent and nothing
+    extra is added. (Fix Round 2: hand-built test envs omitted
+    SystemRoot and the child failed to start on Windows.)
+    """
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    if os.name == "nt" and "SystemRoot" in os.environ:
+        env["SystemRoot"] = os.environ["SystemRoot"]
+    return env
+
 
 EXPECTED_NAMES = [
     "agent.run",
@@ -264,9 +282,22 @@ class FleetTraceTestCase(unittest.TestCase):
         # CPython's locale coercion (PEP 538) sets LC_CTYPE inside the child
         # interpreter itself; the coordinator never passes it. It is a
         # locale setting, not a secret carrier, so it is excluded here.
+        # Windows environment names are case-insensitive, so compare
+        # upper-cased; Windows also surfaces PROCESSOR_ARCHITECTURE in
+        # child processes. It is a system identifier, not a secret
+        # carrier, so it is permitted explicitly on Windows only.
+        # (Fix Round 2: the strict POSIX key set failed on Windows
+        # SYSTEMROOT / PROCESSOR_ARCHITECTURE.) The secret-leak
+        # assertions above (no FAKE_API_KEY / MY_TOKEN keys) are the
+        # security-critical checks and are unchanged.
+        allowed_upper = {k.upper() for k in allowed}
+        seen_upper = {k.upper() for k in env_keys}
+        excluded = {"LC_CTYPE"}
+        if os.name == "nt":
+            excluded |= {"PROCESSOR_ARCHITECTURE"}
         self.assertTrue(
-            env_keys - {"LC_CTYPE"} <= allowed,
-            f"child saw non-allowlisted vars: {sorted(env_keys - allowed - {'LC_CTYPE'})}",
+            seen_upper - excluded <= allowed_upper,
+            f"child saw non-allowlisted vars: {sorted(seen_upper - allowed_upper - excluded)}",
         )
         self.assertIn("TRACEPARENT", env_keys)
         self.assertIn("FLEET_TASK_ID", env_keys)
@@ -274,7 +305,7 @@ class FleetTraceTestCase(unittest.TestCase):
     # -- missing / invalid TRACEPARENT -> unparented -------------------------
     def test_missing_invalid_traceparent(self):
         base_env = {
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            **_child_env_base(),
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": self.endpoint,
             "FLEET_TASK_ID": "task-unparented-1",
             "FLEET_SESSION_ID": "session-unparented-1",
@@ -317,7 +348,7 @@ class FleetTraceTestCase(unittest.TestCase):
     # -- early termination ----------------------------------------------------
     def test_early_termination(self):
         env = {
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            **_child_env_base(),
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": self.endpoint,
             "FLEET_TASK_ID": "task-abrupt-1",
             "FLEET_SESSION_ID": "session-abrupt-1",
@@ -363,6 +394,17 @@ class FleetTraceTestCase(unittest.TestCase):
         self.assertEqual(numbers["gen_ai.usage.input_tokens"], 1200)
 
     # -- signal handlers flush on SIGTERM (Fix Round 1, G1-P1-01) ------------
+    # POSIX-only end-to-end: on Windows, os.kill/SIGTERM terminates the
+    # process via TerminateProcess, which bypasses Python signal
+    # handlers, so the SIGTERM-flush path cannot be delivered that way
+    # there (the process exits 1 instead of -15). The handler logic
+    # itself is covered platform-independently by
+    # test_signal_handler_flushes_directly below.
+    @unittest.skipIf(
+        os.name == "nt",
+        "Windows TerminateProcess bypasses Python signal handlers; "
+        "SIGTERM-flush delivery is POSIX-only",
+    )
     def test_signal_handlers_flush_on_sigterm(self):
         script = (
             "import sys, time\n"
@@ -400,6 +442,29 @@ class FleetTraceTestCase(unittest.TestCase):
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0]["name"], "agent.run")
 
+    def test_signal_handler_flushes_directly(self):
+        # Fix Round 2: the handler logic (flush + shutdown + restore
+        # default + re-signal) is tested directly on every platform,
+        # with os.kill patched so the test process itself is not
+        # killed. Runs on Windows too, where the subprocess SIGTERM
+        # test above is skipped.
+        provider = mock.Mock()
+        saved_int = signal.getsignal(signal.SIGINT)
+        saved_term = signal.getsignal(signal.SIGTERM)
+        try:
+            handler = _install_signal_handlers(provider)
+            self.assertTrue(callable(handler))
+            with mock.patch("fleet_trace.os.kill") as fake_kill:
+                handler(signal.SIGTERM, None)
+            provider.force_flush.assert_called_once()
+            provider.shutdown.assert_called_once()
+            fake_kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+            # The handler restored the default before re-signalling.
+            self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+        finally:
+            signal.signal(signal.SIGINT, saved_int)
+            signal.signal(signal.SIGTERM, saved_term)
+
     def test_signal_handlers_registered(self):
         saved_int = signal.getsignal(signal.SIGINT)
         saved_term = signal.getsignal(signal.SIGTERM)
@@ -418,7 +483,7 @@ class FleetTraceTestCase(unittest.TestCase):
         trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
         span_id = "00f067aa0ba902b7"
         env = {
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            **_child_env_base(),
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": self.endpoint,
             "FLEET_TASK_ID": "task-valid-tp-1",
             "FLEET_SESSION_ID": "session-valid-tp-1",

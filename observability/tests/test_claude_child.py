@@ -148,13 +148,28 @@ class ClaudeChildTestCase(unittest.TestCase):
         self.endpoint = self.recv.endpoint
         self._saved_env = dict(os.environ)
         # Stub `claude` on PATH (prepended; the real PATH is restored in
-        # tearDown and in the live test).
+        # tearDown and in the live test). Platform-aware: Windows cannot
+        # execute an extensionless script via PATH lookup (PATHEXT), so
+        # on Windows the stub is claude.cmd (batch wrapper) + claude.py
+        # (the stub code); on POSIX it is the executable script `claude`
+        # itself. (Fix Round 2: the extensionless stub was invisible to
+        # Windows shutil.which(), which fell back to the real
+        # unauthenticated VS Code claude.exe binary.)
         self.bindir = self.tmpdir / "bin"
         self.bindir.mkdir()
         self.env_file = self.tmpdir / "stub_env.json"
-        stub = self.bindir / "claude"
-        stub.write_text(STUB_CLAUDE.replace("__OUT_FILE__", str(self.env_file)))
-        stub.chmod(0o755)
+        stub_code = STUB_CLAUDE.replace("__OUT_FILE__", str(self.env_file))
+        if os.name == "nt":
+            (self.bindir / "claude.py").write_text(stub_code)
+            (self.bindir / "claude.cmd").write_text(
+                '@echo off\r\npython "%~dp0claude.py" %*\r\n'
+            )
+            self.stub_path = self.bindir / "claude.cmd"
+        else:
+            stub = self.bindir / "claude"
+            stub.write_text(stub_code)
+            stub.chmod(0o755)
+            self.stub_path = stub
         os.environ["PATH"] = str(self.bindir) + os.pathsep + os.environ.get("PATH", "")
 
     def tearDown(self):
@@ -264,7 +279,7 @@ class ClaudeChildTestCase(unittest.TestCase):
 
     def test_resolve_claude_path_prefers_path(self):
         # The stub on PATH (setUp) wins over any extension install.
-        self.assertEqual(resolve_claude_path(), str(self.bindir / "claude"))
+        self.assertEqual(resolve_claude_path(), str(self.stub_path))
 
     def test_resolve_claude_path_missing(self):
         with mock.patch.dict(os.environ, {"PATH": str(self.tmpdir)}):
@@ -277,7 +292,7 @@ class ClaudeChildTestCase(unittest.TestCase):
 
     def test_launch_claude_uses_env_override_path(self):
         # Stub is NOT on PATH here; the env override must still find it.
-        os.environ["FLEET_CLAUDE_PATH"] = str(self.bindir / "claude")
+        os.environ["FLEET_CLAUDE_PATH"] = str(self.stub_path)
         os.environ["PATH"] = self._saved_env.get("PATH", "")
         env = build_claude_child_env(
             {}, "task-override-1", "session-override-1",
