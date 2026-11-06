@@ -96,6 +96,11 @@ class LocalReceiver:
         self._lock = threading.Lock()
         self.payloads = []  # decoded JSON payloads, in arrival order
         self.spans = []  # flattened span dicts, in arrival order
+        # Rejected POSTs to /v1/traces (metadata only: content-type +
+        # length, never raw bytes). A real agent exporting protobuf hits
+        # this; the harness reports it as a transport mismatch instead
+        # of silently losing the spans.
+        self.rejected = []
         self._server = None
         self._thread = None
 
@@ -138,9 +143,23 @@ class LocalReceiver:
                 try:
                     payload = json.loads(raw.decode("utf-8"))
                 except (ValueError, UnicodeDecodeError):
+                    with receiver._lock:
+                        receiver.rejected.append(
+                            {
+                                "content_type": self.headers.get("Content-Type"),
+                                "length": length,
+                            }
+                        )
                     self._send_json(400, {"error": "invalid JSON"})
                     return
                 if not isinstance(payload, dict) or "resourceSpans" not in payload:
+                    with receiver._lock:
+                        receiver.rejected.append(
+                            {
+                                "content_type": self.headers.get("Content-Type"),
+                                "length": length,
+                            }
+                        )
                     self._send_json(400, {"error": "not an OTLP traces payload"})
                     return
                 receiver._handle_payload(payload)
