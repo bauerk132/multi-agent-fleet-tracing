@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 from opentelemetry import propagate, trace
@@ -47,6 +48,17 @@ def _log(*args):
     print(*args, file=sys.stderr, flush=True)
 
 
+# Fix Round 1 (G2-P3-01): strict W3C traceparent Level 2 validation.
+# A malformed header is dropped (and logged) instead of being handed to
+# the propagator, so the child never parents to a garbage context.
+_TRACEPARENT_RE = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
+
+
+def is_valid_traceparent(value):
+    """True only for a well-formed W3C traceparent (version 00)."""
+    return bool(value) and bool(_TRACEPARENT_RE.match(value))
+
+
 def main():
     propagate.set_global_textmap(
         CompositePropagator([TraceContextTextMapPropagator(), W3CBaggagePropagator()])
@@ -61,7 +73,13 @@ def main():
     # --- Child extraction (S1 fix): extract, then validate. ---
     # W3C header names are lowercase ("traceparent"); env vars are
     # uppercase ("TRACEPARENT"). The propagator's getter is case-sensitive,
-    # so the carrier must use lowercase keys.
+    # so the carrier must use lowercase keys. A malformed TRACEPARENT is
+    # dropped here (G2-P3-01) instead of reaching the propagator.
+    if "TRACEPARENT" in os.environ and not is_valid_traceparent(
+        os.environ["TRACEPARENT"]
+    ):
+        _log("child: rejecting malformed TRACEPARENT")
+        del os.environ["TRACEPARENT"]
     carrier = {
         key.lower(): os.environ[key]
         for key in ("TRACEPARENT", "TRACESTATE", "BAGGAGE")

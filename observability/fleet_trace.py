@@ -29,8 +29,10 @@ import atexit
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import threading
 import uuid
 
 from opentelemetry import propagate, trace
@@ -103,6 +105,10 @@ SAFE_ERROR_MESSAGES = frozenset(
     }
 )
 
+# Fix Round 1 (G2-P2-02): dynamic string attributes are truncated to
+# this many characters so a long value cannot balloon telemetry buffers.
+MAX_ATTRIBUTE_CHARS = 256
+
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 _PROPAGATORS_SET = False
@@ -141,10 +147,12 @@ def sanitize_attributes(attrs):
             continue
         if key == "error.message" and value not in SAFE_ERROR_MESSAGES:
             value = "Error; details withheld"
-        if isinstance(value, str) and (
-            _EMAIL_RE.search(value) or value.startswith(("sk-", "Bearer "))
-        ):
-            value = "[REDACTED]"
+        if isinstance(value, str):
+            # Fix Round 1 (G2-P2-02): bound dynamic string attributes.
+            if len(value) > MAX_ATTRIBUTE_CHARS:
+                value = value[:MAX_ATTRIBUTE_CHARS]
+            if _EMAIL_RE.search(value) or value.startswith(("sk-", "Bearer ")):
+                value = "[REDACTED]"
         clean[key] = value
     return clean
 
@@ -178,6 +186,38 @@ def _flush_quietly(provider):
         pass
 
 
+def _install_signal_handlers(provider):
+    """Register SIGINT/SIGTERM handlers that flush + shut down tracing.
+
+    Fix Round 1 (G1-P1-01): atexit alone does not run when the process
+    is killed by SIGTERM, so in-flight batch spans would be dropped.
+    The handler flushes, shuts down, then restores the default handler
+    and re-sends the signal so the process still terminates with the
+    original signal semantics. No-ops outside the main thread and on
+    platforms where a signal cannot be caught.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def _handler(signum, _frame):
+        _flush_quietly(provider)
+        try:
+            provider.shutdown()
+        except Exception:
+            pass
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except (ValueError, OSError, RuntimeError):
+            pass
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError, RuntimeError):
+            pass
+
+
 def init_tracing(endpoint, service_name):
     """Init propagators, provider, exporter, processor. Returns (provider, tracer).
 
@@ -203,8 +243,10 @@ def init_tracing(endpoint, service_name):
         )
     )
     # Flush on any exit path (normal, sys.exit, unhandled exception).
-    # No guarantee for SIGKILL / sudden power loss (see README.md).
+    # SIGINT/SIGTERM get explicit handlers too (atexit does not run for
+    # SIGTERM). No guarantee for SIGKILL / sudden power loss (see README.md).
     atexit.register(_flush_quietly, provider)
+    _install_signal_handlers(provider)
     return provider, provider.get_tracer("fleet.coordinator", "1.0.0")
 
 

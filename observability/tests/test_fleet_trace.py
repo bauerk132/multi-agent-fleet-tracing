@@ -20,6 +20,7 @@ Run from observability/:
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -29,11 +30,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fixture import TRACE_ID as FIXTURE_TRACE_ID
-from fixture import export_fixture, fixture_spec
+from fixture import export_external_agent_link, export_fixture, fixture_spec
 from fleet_trace import (
     ALLOWED_CHILD_ENV,
+    MAX_ATTRIBUTE_CHARS,
     TRACE_ENV_VARS,
     build_child_env,
+    init_tracing,
     run_intent,
     sanitize_attributes,
     spawn_controlled_child,
@@ -344,6 +347,127 @@ class FleetTraceTestCase(unittest.TestCase):
             and s["attributes"].get("task.id") == "task-abrupt-1"
         ]
         self.assertEqual(len(child_tools), 1)
+
+    # -- attribute length guard (Fix Round 1, G2-P2-02) ---------------------
+    def test_attribute_length_guard(self):
+        long_reason = "r" * 300
+        clean = sanitize_attributes(
+            {"handoff.reason": long_reason, "agent.name": "x"}
+        )
+        self.assertEqual(len(clean["handoff.reason"]), MAX_ATTRIBUTE_CHARS)
+        self.assertEqual(clean["handoff.reason"], "r" * MAX_ATTRIBUTE_CHARS)
+        self.assertEqual(clean["agent.name"], "x")
+        short = sanitize_attributes({"handoff.reason": "delegate"})
+        self.assertEqual(short["handoff.reason"], "delegate")
+        numbers = sanitize_attributes({"gen_ai.usage.input_tokens": 1200})
+        self.assertEqual(numbers["gen_ai.usage.input_tokens"], 1200)
+
+    # -- signal handlers flush on SIGTERM (Fix Round 1, G1-P1-01) ------------
+    def test_signal_handlers_flush_on_sigterm(self):
+        script = (
+            "import sys, time\n"
+            f"sys.path.insert(0, {str(HERE)!r})\n"
+            "from fleet_trace import init_tracing\n"
+            "from opentelemetry.trace import SpanKind\n"
+            "provider, tracer = init_tracing(sys.argv[1], 'fleet-signal-test')\n"
+            "span = tracer.start_span('agent.run', kind=SpanKind.INTERNAL, attributes={'agent.name': 'fleet-signal-test', 'session.id': 's', 'task.id': 't'})\n"
+            "span.end()\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script, self.endpoint],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            line = proc.stdout.readline()
+            self.assertEqual(line.strip(), "ready")
+            proc.send_signal(signal.SIGTERM)
+            rc = proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.stdout.close()
+            proc.stderr.close()
+        self.assertEqual(rc, -signal.SIGTERM)
+        got = [
+            s
+            for s in self._spans()
+            if (s.get("resource") or {}).get("service.name") == "fleet-signal-test"
+        ]
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["name"], "agent.run")
+
+    def test_signal_handlers_registered(self):
+        saved_int = signal.getsignal(signal.SIGINT)
+        saved_term = signal.getsignal(signal.SIGTERM)
+        try:
+            provider, _ = init_tracing(self.endpoint, "fleet-signal-reg")
+            self.assertTrue(callable(signal.getsignal(signal.SIGINT)))
+            self.assertTrue(callable(signal.getsignal(signal.SIGTERM)))
+            provider.shutdown()
+        finally:
+            signal.signal(signal.SIGINT, saved_int)
+            signal.signal(signal.SIGTERM, saved_term)
+
+    # -- traceparent validation (Fix Round 1, G2-P3-01) ----------------------
+    def test_traceparent_validation(self):
+        # Well-formed traceparent is accepted and parented.
+        trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+        span_id = "00f067aa0ba902b7"
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": self.endpoint,
+            "FLEET_TASK_ID": "task-valid-tp-1",
+            "FLEET_SESSION_ID": "session-valid-tp-1",
+            "FLEET_HANDOFF_REF": "payload:valid-tp-1",
+            "TRACEPARENT": f"00-{trace_id}-{span_id}-01",
+        }
+        report = spawn_controlled_child(CHILD_PATH, env)
+        self.assertTrue(report.get("ok"), f"child failed: {report}")
+        self.assertTrue(report.get("parented"))
+        self.assertEqual(report.get("trace_id"), trace_id)
+        self.assertEqual(report.get("parent_span_id"), span_id)
+        # Uppercase hex is NOT valid W3C (lowercase only) -> unparented.
+        bad_env = dict(
+            env,
+            TRACEPARENT=f"00-{trace_id.upper()}-{span_id.upper()}-01",
+            FLEET_TASK_ID="task-valid-tp-2",
+        )
+        report_bad = spawn_controlled_child(CHILD_PATH, bad_env)
+        self.assertTrue(report_bad.get("ok"), f"child failed: {report_bad}")
+        self.assertFalse(report_bad.get("parented"))
+        self.assertIsNone(report_bad.get("parent_span_id"))
+
+    # -- external agent links back via span link (Fix Round 1, G1-P1-02) -----
+    def test_external_agent_span_link(self):
+        summary = run_intent(self.endpoint, "fleet-test-coordinator", CHILD_PATH)
+        handoffs = self._spans_named("agent.handoff")
+        external = [
+            h for h in handoffs if h["attributes"].get("agent.to") == "external-agent"
+        ]
+        self.assertEqual(len(external), 1)
+        ext_handoff = external[0]
+        result = export_external_agent_link(
+            self.endpoint,
+            summary["trace_id"],
+            ext_handoff["spanId"],
+            summary["task_id"],
+            summary["session_id"],
+            ext_handoff["attributes"]["handoff.payload_ref"],
+        )
+        self.assertNotEqual(result["trace_id"], summary["trace_id"])
+        ext_spans = [s for s in self._spans() if s["traceId"] == result["trace_id"]]
+        self.assertEqual(len(ext_spans), 1)
+        ext = ext_spans[0]
+        self.assertIsNone(ext.get("parentSpanId"))
+        self.assertEqual(len(ext.get("links") or []), 1)
+        link = ext["links"][0]
+        self.assertEqual(link["traceId"], summary["trace_id"])
+        self.assertEqual(link["spanId"], ext_handoff["spanId"])
+        self.assertEqual(link["attributes"].get("link.type"), "external_boundary")
 
     # -- deterministic 12-span fixture ---------------------------------------
     def test_fixture_12_spans(self):

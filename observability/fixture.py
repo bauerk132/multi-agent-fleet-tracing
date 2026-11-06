@@ -44,12 +44,15 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.id_generator import IdGenerator
 from opentelemetry.trace import (
+    Link,
     NonRecordingSpan,
     SpanContext,
     SpanKind,
     Status,
     StatusCode,
     TraceFlags,
+    format_span_id,
+    format_trace_id,
     set_span_in_context,
 )
 
@@ -334,6 +337,54 @@ def export_fixture(endpoint, service_name="fleet-fixture"):
     provider.force_flush()
     provider.shutdown()
     return fixture_spec()
+
+
+def export_external_agent_link(endpoint, handoff_trace_id, handoff_span_id,
+                               task_id, session_id, payload_ref,
+                               service_name="external-agent"):
+    """Simulate the external agent's side of a cross-boundary handoff.
+
+    Fix Round 1 (G1-P1-02): an external autonomous agent must NOT be
+    given a fabricated parent span. It starts its own root trace and
+    links back to the coordinator's handoff span with an OpenTelemetry
+    Span Link (link.type = "external_boundary"). Correlation also
+    carries the ledger IDs and payload ref.
+
+    Returns {"trace_id", "span_id"} for the external root span.
+    """
+    provider = TracerProvider(
+        resource=Resource({"service.name": service_name, "agent.name": "external-agent"}),
+    )
+    provider.add_span_processor(SimpleSpanProcessor(OTLPJSONExporter(endpoint)))
+    tracer = provider.get_tracer("fleet.external", "1.0.0")
+    link_ctx = SpanContext(
+        trace_id=int(handoff_trace_id, 16),
+        span_id=int(handoff_span_id, 16),
+        is_remote=True,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
+    )
+    span = tracer.start_span(
+        "agent.run",
+        kind=SpanKind.INTERNAL,
+        attributes=sanitize_attributes(
+            {
+                "agent.name": "external-agent",
+                "session.id": session_id,
+                "task.id": task_id,
+                "handoff.payload_ref": payload_ref,
+            }
+        ),
+        links=[Link(link_ctx, {"link.type": "external_boundary"})],
+    )
+    ctx = span.get_span_context()
+    result = {
+        "trace_id": format_trace_id(ctx.trace_id),
+        "span_id": format_span_id(ctx.span_id),
+    }
+    span.end()
+    provider.force_flush()
+    provider.shutdown()
+    return result
 
 
 def main():
