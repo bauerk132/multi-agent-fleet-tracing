@@ -158,7 +158,12 @@ class ClaudeChildTestCase(unittest.TestCase):
         self.bindir = self.tmpdir / "bin"
         self.bindir.mkdir()
         self.env_file = self.tmpdir / "stub_env.json"
-        stub_code = STUB_CLAUDE.replace("__OUT_FILE__", str(self.env_file))
+        # as_posix(): the path is baked into the generated claude.py
+        # source as a string literal, so Windows backslashes would
+        # become escapes (C:\Users -> \U unicode escape -> SyntaxError).
+        # Forward slashes are valid in a Python string literal on every
+        # platform and Windows accepts them in paths. (Fix Round 3.)
+        stub_code = STUB_CLAUDE.replace("__OUT_FILE__", self.env_file.as_posix())
         if os.name == "nt":
             (self.bindir / "claude.py").write_text(stub_code)
             (self.bindir / "claude.cmd").write_text(
@@ -279,7 +284,13 @@ class ClaudeChildTestCase(unittest.TestCase):
 
     def test_resolve_claude_path_prefers_path(self):
         # The stub on PATH (setUp) wins over any extension install.
-        self.assertEqual(resolve_claude_path(), str(self.stub_path))
+        # normcase(): Windows which() returns the extension in PATHEXT
+        # case (claude.CMD) while the file on disk is claude.cmd.
+        # (Fix Round 3.)
+        self.assertEqual(
+            os.path.normcase(resolve_claude_path()),
+            os.path.normcase(str(self.stub_path)),
+        )
 
     def test_resolve_claude_path_missing(self):
         with mock.patch.dict(os.environ, {"PATH": str(self.tmpdir)}):
