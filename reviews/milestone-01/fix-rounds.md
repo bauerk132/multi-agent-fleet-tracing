@@ -371,3 +371,82 @@ Windows verification step for this round.
   Antigravity's per Kyle's rule). Re-review must verify the exact
   commit, rerun `scripts/run_offline_tests.py` on Windows, and confirm
   the 10 failures from the previous round are gone.
+
+---
+
+# Milestone 2 — Fix Round 3 (Antigravity re-review of Fix Round 2, 2026-11-06)
+
+**Review under fix:** Antigravity G1/G2 re-review of staging commit
+`1d885e8a` (HiveMind handoff `hof_01M6SGG3E1DT6ZDTTV`, update 2026-11-06
+23:52 UTC).
+**Verdicts being fixed:** M1 **PASSED** (16 passed, 1 skipped, 0 failed);
+M2 **FAIL** — 6 failures in `test_claude_child.py`.
+**Fix-round commit (local git):** `885ae9f` — "Fix Round 3 (M2-only):
+as_posix() for stub OUT_FILE path, normcase() for .CMD vs .cmd"
+(3 files, +124/−7).
+**Branch:** `staging`. **Date:** 2026-11-06. **Builder:** Muse.
+
+> **How to read this round:** M1 is accepted by this review (both gates,
+> Antigravity's, per Kyle's rule). This round is M2-only: two one-line
+> test fixes, no production-code change at all. The 6 failures split
+> 5 + 1 with two distinct root causes.
+
+## Findings
+
+### FR3-01 — stub template bakes Windows backslashes into generated Python (5 tests): SyntaxError: unicodeescape
+
+- **Reviewer repro:** on the Windows host, the generated `claude.py`
+  stub contained `OUT_FILE = "C:\Users\kbaue\..."`; `\U` is a unicode
+  escape, so the stub failed to parse (`SyntaxError: unicodeescape`)
+  and every test that runs the stub failed:
+  `test_stub_claude_parented_end_to_end`,
+  `test_no_secrets_in_claude_child_env`,
+  `test_stub_claude_missing_traceparent_unparented`,
+  `test_stub_claude_nonzero_exit`,
+  `test_launch_claude_uses_env_override_path`.
+- **Root cause:** `STUB_CLAUDE.replace("__OUT_FILE__", str(self.env_file))`
+  baked a Windows path with backslashes into generated Python source
+  as a string literal.
+- **Correction:** use `self.env_file.as_posix()` — forward slashes are
+  valid in a Python string literal on every platform and Windows
+  accepts them in paths. One line in `test_claude_child.setUp`.
+- **Regression test:** the 5 affected tests above.
+
+### FR3-02 — `.CMD` vs `.cmd` case comparison (1 test)
+
+- **Reviewer repro:** `test_resolve_claude_path_prefers_path` failed on
+  the Windows host — `shutil.which()` returns the extension in PATHEXT
+  case (`claude.CMD`) while the file on disk is `claude.cmd`.
+- **Root cause:** exact string comparison of a Windows path, where
+  case is not significant.
+- **Correction:** compare with `os.path.normcase()` on both sides
+  (no-op on POSIX, lower-cases + normalizes separators on Windows).
+  One line in `test_claude_child.py`.
+- **Regression test:** `test_resolve_claude_path_prefers_path`.
+
+## Test results (re-run for this round, 2026-11-06)
+
+Command: `python3 scripts/run_offline_tests.py` (from `observability/`,
+venv Python 3.12, OTel 1.45.1)
+
+**28 run, 27 passed, 1 skipped, 0 failed, 18.3s.**
+
+No new tests in this round. The M1 suite stays at 17 tests; the M2
+suite stays at 11 tests (one live test still skipped: no real `claude`
+binary on this machine).
+
+**Windows verification caveat:** this VM is Linux, so the Windows-side
+behavior is verified by reasoning + the reviewer's Windows run, not by
+executing the suite on Windows here. The focused re-test on the laptop
+is the Windows verification step for this round.
+
+## Gate status after Fix Round 3
+
+- **M1 acceptance:** DECLARED — Antigravity G1+G2 passed M1 on staging
+  `1d885e8a` (16 passed, 1 skipped, 0 failed). Milestone 1 is accepted.
+- **M2 acceptance:** NOT DECLARED. Fix Round 3 is a builder claim
+  (Implemented + Tested), not acceptance.
+- **Next required action:** Antigravity runs one focused re-test of the
+  M2 harness on the laptop (staging commit for this round) and hands
+  back the outcome. Per Kyle (2026-11-06), after that focused test the
+  work moves on to Milestone 3.

@@ -125,11 +125,26 @@ Receiver on `http://127.0.0.1:4318/v1/traces`; coordinator run, then fixture exp
   passed / 1 skipped). Builder claims Implemented + Tested only.
   Windows-side behavior verified by reasoning + the reviewer's Windows
   run, not by executing the suite on Windows on this VM.
-- **Milestone 1 acceptance:** NOT DECLARED.
-- **Next required action:** Antigravity re-reviews the Fix Round 2
-  commit from a laptop clone (see the re-review handoff in HiveMind)
-  and records new verdicts in `g1-verification.md` /
-  `g2-independent-review.md`.
+- **Antigravity re-review of Fix Round 2 RECEIVED 2026-11-06** (HiveMind
+  handoff `hof_01M6SGG3E1DT6ZDTTV`, update 23:52 UTC): staging commit
+  `1d885e8a` — M1 **PASSED** (16 passed, 1 skipped, 0 failed); M2
+  **FAIL** — 6 failures in `test_claude_child.py` (5 from unescaped
+  backslashes in the stub template, 1 from `.CMD` vs `.cmd` case).
+  Verdict: **FIX ROUND 3 REQUIRED for the M2 harness**. Detailed
+  reports live on the laptop only
+  (`reviews/milestone-01/g1-verification.md`,
+  `g2-independent-review.md`); they were not pushed to GitHub.
+- **Fix Round 3 DONE** — see `fix-rounds.md` (M2-only, no production
+  code change; 28 run / 27 passed / 1 skipped). Builder claims
+  Implemented + Tested only.
+- **Milestone 1 acceptance:** DECLARED — Antigravity G1+G2 passed M1
+  on staging `1d885e8a` (16 passed, 1 skipped, 0 failed).
+- **Milestone 2 acceptance:** NOT DECLARED.
+- **Next required action:** Antigravity runs one focused re-test of the
+  M2 harness on the laptop (see the re-review handoff in HiveMind) and
+  hands back the outcome. Per Kyle (2026-11-06), after that focused
+  test the work moves on to Milestone 3. Merging staging to main still
+  needs Kyle's explicit go-ahead.
 
 ## 8. Status vocabulary (Engineering Quality & Security Standards §2)
 
@@ -160,3 +175,17 @@ change only: `_install_signal_handlers` returns the handler it registered
 (testability). Windows-side behavior is verified by reasoning + the
 reviewer's Windows run, not by executing the suite on Windows here;
 the laptop re-review is the Windows verification step.
+
+## 11. Fix Round 3 (2026-11-06) — M2-only
+
+Antigravity's re-review of staging `1d885e8a` passed M1 (16 passed, 1
+skipped, 0 failed) and failed M2 on 6 `test_claude_child.py` failures,
+answered in `fix-rounds.md`: FR3-01 — the stub template baked Windows
+backslashes into generated Python (`OUT_FILE = "C:\Users\..."` →
+unicodeescape SyntaxError), fixed with `as_posix()`; FR3-02 — `which()`
+returns `claude.CMD` vs the on-disk `claude.cmd`, fixed with
+`os.path.normcase()`. No production-code change. Suite stays at **28
+run, 27 passed, 1 skipped** (live-Claude test), re-run via
+`python3 scripts/run_offline_tests.py`. M1 acceptance is DECLARED by
+this review. Next: one focused M2 re-test by Antigravity on the laptop,
+then Milestone 3 per Kyle.
