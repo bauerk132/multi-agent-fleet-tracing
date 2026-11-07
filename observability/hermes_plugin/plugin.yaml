@@ -8,3 +8,26 @@
 name: fleet-trace-observer
 version: 0.1.0
 description: "Read-only Hermes observer (Milestone 3): hook events to OTel spans via a bounded off-path worker. Isolated-profile validation pending."
+# Fix Round 5 (FR5-02): runtime dependencies, pinned exactly as in
+# observability/requirements.txt (OTel 1.45.1). register() fails with a
+# clear RuntimeError if OpenTelemetry is absent instead of leaking an
+# ImportError traceback into the host.
+python_dependencies:
+  - opentelemetry-api==1.45.1
+  - opentelemetry-sdk==1.45.1
+  - opentelemetry-exporter-otlp-proto-http==1.45.1
+# Fix Round 5 (FR5-05): the hooks register(ctx) wires on the host.
+# Keep in sync with _HOOK_NAMES in __init__.py.
+provides_hooks:
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+  - pre_tool_call
+  - post_tool_call
+  - subagent_start
+  - subagent_stop
+  - on_session_end
+  - on_session_finalize
+  - on_session_reset
+  - on_human_input_request
+  - on_human_input_resolved
