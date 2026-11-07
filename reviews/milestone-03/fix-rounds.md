@@ -266,7 +266,7 @@ events are dropped as invalid, human-input outcomes and tool error
 types degrade to unknown, parallel tool calls collapse onto one dedup
 key.
 **Branch:** `main` (HEAD `ca6fe35`). **Date:** 2026-11-07. **Builder:** Muse.
-**Fix-round commit (local git):** `TBD` — "Fix Round 6 (M3): live Hermes runtime kwargs fixes" (filled in on commit).
+**Fix-round commit (local git):** `92d1de3` — "Fix Round 6 (M3): live Hermes runtime kwargs fixes" (5 files, +624/−22).
 
 > **How to read this round:** same as FR5 — every finding with
 > severity (P1 / blocking acceptance, per Antigravity), the reviewer
