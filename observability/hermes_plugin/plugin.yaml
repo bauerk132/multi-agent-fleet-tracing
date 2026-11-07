@@ -1,10 +1,10 @@
-# NOT VERIFIED — DO NOT INSTALL.
-# Staged documentation example only (Milestone 1).
-# The Hermes plugin contract (manifest syntax, register(ctx) signature,
-# hook names, payload fields, CLI commands, installed version) is
-# UNVERIFIED against any installed Hermes build. Milestone 3 validates
-# it against the exact tagged release and the locally installed version
-# before anything is shipped. Fallback until then: external agent.handoff.
+# Hermes observer plugin — Milestone 3.
+# Read-only observer: registers documented hooks only, never mutates tool
+# args or conversation text, never performs network I/O in a callback.
+# Do NOT enable in the active Hermes profile until the installed-build
+# contract test (M3 acceptance) passes on the dev machine in a disposable
+# profile. The register(ctx) signature, hook names and payload shapes are
+# validated there, not assumed here.
 name: fleet-trace-observer
 version: 0.1.0
-description: "UNVERIFIED STUB — read-only observer plugin sketch, not installable."
+description: "Read-only Hermes observer (Milestone 3): hook events to OTel spans via a bounded off-path worker. Isolated-profile validation pending."
