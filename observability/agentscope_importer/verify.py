@@ -18,7 +18,6 @@ from .importer import (
     import_canonical_document,
     import_otlp_payload,
     import_spans,
-    now_iso,
 )
 from .mapper import map_spans
 

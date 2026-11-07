@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 
 from .contract import (
     DEFAULT_KIND,
-    FEED_NAME,
     FLEET_SCHEMA_VERSION,
     KIND_MAP,
     SCHEMA_VERSION,

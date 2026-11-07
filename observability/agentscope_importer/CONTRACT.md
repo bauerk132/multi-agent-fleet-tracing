@@ -206,7 +206,13 @@ Every import returns an `ImportReceipt` (dict + stored row):
 
 Quality mirrors the real importer (§2), first match wins. A
 duplicate-content import returns the **original** receipt with
-`already_imported=True` and no new rows. `run_ids` carries the
+`already_imported=True` and no new rows — where "duplicate content"
+means the same mapped documents **and** the same input accounting
+(unreadable items, dropped runs, mapping notes). The idempotency key
+covers all of those, so two uploads that map to the same documents
+but differ in what was skipped or dropped get distinct receipts;
+a receipt always describes the upload it answers, never an earlier
+one that happened to map the same way. `run_ids` carries the
 ledger run id (`run_` + first 16 hex of
 `sha256(content_sha | "run" | trace_id)` — deterministic per
 content, distinct per upload, mirroring the real importer's

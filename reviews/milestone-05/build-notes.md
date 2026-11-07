@@ -122,10 +122,58 @@ weakening the test):
   (10), and the checkout lacked the migration file. Both fixed;
   the check now PASSES with quality `complete`.
 
-## Double-check pass (Kyle's direction)
+## Double-check pass (Kyle's direction — done before the review handoff)
 
-See "Double-check" in the final report: the build was re-verified
-from scratch after completion — contract re-read against §10/§12,
-every edge case re-verified, the full suite re-run fresh, and the
-staging push re-verified independently from GitHub (head listed,
-pushed files read back). Findings (if any) are recorded there.
+Re-verified from scratch after the build was complete:
+
+1. **Contract re-read against §10/§12.** The Notion plan page was
+   re-fetched and gate 4 (§12) checked line by line against
+   CONTRACT.md: actual importer identified; versioned metadata-only
+   import; native IDs preserved; OTLP protocol/content type validated
+   (JSON in, protobuf refused); schema mapping; duplicate delivery;
+   out-of-order arrival; late/missing spans; restart recovery;
+   span dedup by trace_id/span_id; event dedup by explicit
+   source/producer/event identity; provenance and unknown/incomplete
+   outcomes visible; no state replay inferred; bounded ledger with
+   explicit retention; no raw-payload storage; no egress; CLI
+   assertion first; no UI/backend. All 16 points hold. §10's M5 row
+   (safe state references, unknown values, partial coverage,
+   receiver receipt) holds as well.
+2. **Edge cases re-verified independently.** A fresh script
+   (`/tmp/m5-doublecheck.py`, not the verify module) ran a
+   Hermes-shaped turn (hook.exec, agent.handoff-equivalent
+   state.write, an error llm span, a dangling parent, a stripped
+   content canary) out of order through the public API, plus a
+   JSONL file import with a bad line and a receipt lookup. All
+   assertions passed — except one, which exposed a real defect
+   (see below).
+3. **Full suite re-run fresh:** 137 tests, OK (skipped=2). CLI
+   verify re-run fresh: 15/15. Real-import check re-run fresh:
+   PASS (quality `complete`, idempotent).
+4. **Staging push re-verified independently from GitHub:** head
+   listed (`e63a436a…`, parent `68b53aee`), and the 7 key pushed
+   files read back and hashed — every hash matched the committed
+   version exactly.
+
+### What the second pass changed
+
+- **Idempotency-key gap (real defect, fixed).** The key covered
+  only the mapped documents. A duplicate-content upload that also
+  carried an unreadable line (or different dropped runs) returned
+  the original receipt, hiding the skipped line / dropped run —
+  the receipt did not describe the upload it answered. Fixed:
+  `_outcome_sha` now covers the documents AND the input accounting
+  (unreadable count, dropped runs, mapping notes). Two regression
+  tests added (44 M5 tests total); CONTRACT.md §5 reworded. The
+  fix was itself re-verified (suite, CLI, real-import, and the
+  independent spot-check script all pass after it).
+- **Unused imports (cosmetic, fixed).** A scan found four unused
+  imports (`FEED_NAME` in mapper.py; `PROTOBUF_CONTENT_TYPE`,
+  `ns_to_iso`, `field` in importer.py; `now_iso` in verify.py).
+  Removed; suite re-run confirms nothing broke.
+- **Checkout gap (found during the build, fixed then).** The
+  AgentScope checkout was missing `store/migrations/0001_init.sql`;
+  fetched from GitHub at `95f8a68` (8,465 bytes, sha `e0d43049…`).
+  The real-import check initially failed `no such table: imports`
+  because `make_importer` does not migrate — the API applies
+  migrations at startup; the check now does the same.

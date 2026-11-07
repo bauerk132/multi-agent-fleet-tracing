@@ -237,6 +237,45 @@ class TestImporter(LedgerCase):
         self.assertEqual(second["import_id"], first["import_id"])
         self.assertEqual(ledger_mod.counts(self.conn), before)
 
+    def test_duplicate_content_with_bad_line_gets_distinct_receipt(self):
+        # Double-check finding: a duplicate-content upload that also
+        # carries an unreadable line must NOT return the original
+        # receipt — the skipped line is part of THIS upload and must
+        # be visible. The spans are still not stored twice.
+        spans = synthetic_turn("r2b")
+        first = import_spans(self.conn, spans, "copilot")
+        lines = [json.dumps(s) for s in spans] + ["{broken"]
+        path = os.path.join(self.tmp.name, "dup.jsonl")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        before = ledger_mod.counts(self.conn)
+        second = import_file(self.conn, path, "copilot")
+        self.assertFalse(second["already_imported"])
+        self.assertNotEqual(second["import_id"], first["import_id"])
+        self.assertEqual(second["quality"], "partial")
+        self.assertEqual(second["stats"]["detection_skipped_lines"], 1)
+        self.assertEqual(second["stats"]["spans"], 3)
+        self.assertEqual(ledger_mod.counts(self.conn)["spans"], before["spans"])
+
+    def test_same_documents_different_dropped_runs_get_distinct_receipts(self):
+        # Same mapped documents, different dropped runs: upload A drops
+        # a run, upload B drops nothing. B must not inherit A's receipt.
+        good = synthetic_turn("r2c-good")
+        bad = synthetic_turn("r2c-bad")
+        bad.append(dict(bad[1]))
+        first = import_spans(self.conn, good + bad, "copilot")
+        self.assertEqual(first["quality"], "partial")
+        self.assertEqual(first["stats"]["dropped"], 1)
+        second = import_spans(self.conn, good, "copilot")
+        self.assertFalse(second["already_imported"])
+        # Quality is warnings, not complete: this upload's spans were
+        # all duplicates of the first upload's stored rows — honestly
+        # reported, and no rows were stored twice. What matters is
+        # that it did NOT inherit the first receipt (dropped=0 here).
+        self.assertEqual(second["quality"], "warnings")
+        self.assertEqual(second["stats"]["dropped"], 0)
+        self.assertTrue(any(w["code"] == "duplicate_span" for w in second["warnings"]))
+
     def test_late_span_joins_run(self):
         spans = synthetic_turn("r3")
         import_spans(self.conn, spans, "copilot")
