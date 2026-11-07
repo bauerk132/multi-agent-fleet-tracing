@@ -43,12 +43,15 @@ COPILOT_OTEL_CAPTURE_IDENTITY=false
 Notes:
 
 - `exporterType: "file"` is the verified local loop: the file
-  exporter writes one JSON value per line. The default exporter is
-  `otlp-http` (protobuf) to `http://localhost:4318`; the local
-  receiver speaks OTLP/HTTP **JSON**, so pointing the default
-  exporter at it would be rejected as a transport mismatch — use
-  the file exporter for the local loop, or put a real OTLP collector
-  (protobuf-capable) in front of the adapter's `handle_payload`.
+  exporter writes one JSON value per line (see "File exporter line
+  shape" below). The default exporter is `otlp-http` to
+  `http://localhost:4318`; `copilot-chat` v0.73.0 defaults the
+  `otlp-http` protocol to `http/json`, so the local receiver (which
+  speaks OTLP/HTTP JSON) accepts it — earlier versions defaulted to
+  protobuf, which the JSON receiver rejects as a transport mismatch.
+  Either way, the file exporter remains the verified local loop; or
+  put a real OTLP collector (protobuf-capable) in front of the
+  adapter's `handle_payload`.
 - `captureContent` and `captureIdentity` MUST stay `false`. The
   adapter strips content/identity attributes even if they arrive,
   but the correct control is to leave them off upstream.
@@ -57,6 +60,52 @@ Notes:
 - OTel is off by default; nothing is exported until the owner
   enables it. Restart / reload the window after changing settings
   if prompted.
+
+## File exporter line shape (ReadableSpan JSONL)
+
+`copilot-chat` v0.73.0 writes one JSON value per line. Each trace
+line is a single `ReadableSpan` object — NOT a full OTLP
+`resourceSpans` payload:
+
+```json
+{
+  "name": "chat",
+  "spanContext": {"traceId": "<32 hex>", "spanId": "<16 hex>"},
+  "parentSpanContext": {"traceId": "<32 hex>", "spanId": "<16 hex>"},
+  "kind": 1,
+  "startTime": [1762450000, 123000000],
+  "endTime": [1762450001, 456000000],
+  "attributes": {"gen_ai.operation.name": "chat"},
+  "events": [],
+  "status": {"code": 1},
+  "resource": {"attributes": {"service.name": "copilot-chat"}},
+  "instrumentationScope": {"name": "copilot-chat", "version": "0.73.0"}
+}
+```
+
+- `startTime` / `endTime` are OTel JS `HrTime` arrays
+  `[seconds, nanoseconds]`; the adapter converts them to Unix
+  nanoseconds (`sec * 1_000_000_000 + nsec`). The older
+  `startTimeUnixNano` / `endTimeUnixNano` form is also accepted.
+- The parent link is `parentSpanContext.spanId` — there is no
+  top-level `parentSpanId` on these lines.
+- Resource attributes live under `resource.attributes` (a flat dict
+  or an OTLP key/value list); `service.name` is read from there, so
+  out-of-scope filtering works on JSONL lines.
+- Span names may carry a target suffix (`"chat github.copilot"`,
+  `"hook PreToolUse"`); the operation is the first token, and
+  `"hook"` maps to `execute_hook`.
+- The file also contains non-trace lines — metric payloads
+  (`resourceMetrics` / `scopeMetrics`, `type: "metric"`,
+  `dataPoints`) and log records (`resourceLogs` / `scopeLogs`, OTel
+  JS log records with `hrTime` + `body`). The adapter skips and
+  counts those, never treats them as errors.
+- Spans in one file are NOT in parent-before-child order: a child
+  span can appear before its `invoke_agent` root (streaming export —
+  the parent had not finished when the child was written). The
+  adapter collects the whole file and orders parents before children,
+  and children whose parent has not been exported yet key their lazy
+  turn root under `(trace_id, root_span_id)`.
 
 ## Run the adapter (owner, on the dev machine)
 
