@@ -4,8 +4,13 @@
 only the reviewer's verdict can do that.
 
 **Repo:** `bauerk132/multi-agent-fleet-tracing`, branch `staging`.
-**Staging commit:** (recorded after the push — see "Staging push" below).
-**Local commits:** (recorded after the local commit — see below).
+**Staging commit:** `02de365137dea73273304c3b313ee5cc342627aa`
+(verified as the staging head on GitHub; parent `e63a436a`, the
+first M5 snapshot).
+**Local commits:** code `4866320`, docs `ae52f08`, double-check
+fixes `1751a62`. The staging hash recorded here was committed
+locally after the push (it rides on the next snapshot push, per
+the FR8 pattern); the handoff to Antigravity names the same hash.
 **Date:** 2026-11-07.
 
 ## What M5 proves
@@ -120,8 +125,17 @@ interpreter (0 skipped).
 
 ## Staging push
 
-(Recorded after the push; verified independently from GitHub — see
-the double-check section in `build-notes.md`.)
+- First snapshot: `e63a436a5ff893daff0b93cefc6b002227168f27`
+  (parent `68b53aee`, the M4 FR8 head). Verified independently
+  from GitHub: head listed, 7 key files read back and hashed,
+  all matching the committed versions.
+- Second snapshot (double-check fixes):
+  `02de365137dea73273304c3b313ee5cc342627aa`. Verified the same
+  way: head listed, all 7 changed files read back and hashed,
+  all matching local commit `1751a62`.
+- Sync record:
+  `~/workspace/multi-agent-fleet-tracing.muse-github-snapshot-sync.json`
+  (16 entries). No merge to main.
 
 ## Design decisions (see build-notes.md for the full list)
 
