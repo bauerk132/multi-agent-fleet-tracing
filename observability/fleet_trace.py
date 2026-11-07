@@ -306,6 +306,8 @@ def run_intent(endpoint, service_name, child_path, spawn_child=True):
     with tracer.start_as_current_span(
         "agent.run",
         kind=SpanKind.INTERNAL,
+        record_exception=False,
+        set_status_on_exception=False,
         attributes=sanitize_attributes(
             {
                 "agent.name": "fleet-coordinator",
@@ -323,6 +325,8 @@ def run_intent(endpoint, service_name, child_path, spawn_child=True):
         with tracer.start_as_current_span(
             "state.write",
             kind=SpanKind.INTERNAL,
+        record_exception=False,
+        set_status_on_exception=False,
             attributes=sanitize_attributes(
                 {
                     "agent.name": "fleet-coordinator",
@@ -342,6 +346,8 @@ def run_intent(endpoint, service_name, child_path, spawn_child=True):
         with tracer.start_as_current_span(
             "agent.handoff",
             kind=SpanKind.INTERNAL,
+        record_exception=False,
+        set_status_on_exception=False,
             attributes=sanitize_attributes(
                 {
                     "agent.name": "fleet-coordinator",
@@ -389,6 +395,8 @@ def run_intent(endpoint, service_name, child_path, spawn_child=True):
         with tracer.start_as_current_span(
             "agent.handoff",
             kind=SpanKind.INTERNAL,
+        record_exception=False,
+        set_status_on_exception=False,
             attributes=sanitize_attributes(
                 {
                     "agent.name": "fleet-coordinator",

@@ -131,9 +131,16 @@ def claude_available():
             "version_error": None,
         }
     try:
+        # Fix Round 4 (M2 close-out): the version check runs the binary
+        # with a minimal env. On Windows the .cmd wrapper cannot start
+        # its Python interpreter without SystemRoot, so include it when
+        # present. (Antigravity focused M2 re-test, 2026-11-06.)
+        version_env = {"PATH": os.environ.get("PATH", "")}
+        if os.name == "nt" and "SystemRoot" in os.environ:
+            version_env["SystemRoot"] = os.environ["SystemRoot"]
         proc = subprocess.run(
             [path, "--version"],
-            env={"PATH": os.environ.get("PATH", "")},
+            env=version_env,
             capture_output=True,
             text=True,
             timeout=10,
@@ -333,6 +340,8 @@ def run_claude_intent(prompt, endpoint=None, receiver=None,
     with tracer.start_as_current_span(
         "agent.run",
         kind=SpanKind.INTERNAL,
+        record_exception=False,
+        set_status_on_exception=False,
         attributes=sanitize_attributes(
             {
                 "agent.name": "fleet-claude-coordinator",
@@ -348,6 +357,8 @@ def run_claude_intent(prompt, endpoint=None, receiver=None,
         with tracer.start_as_current_span(
             "agent.handoff",
             kind=SpanKind.INTERNAL,
+        record_exception=False,
+        set_status_on_exception=False,
             attributes=sanitize_attributes(
                 {
                     "agent.name": "fleet-claude-coordinator",
