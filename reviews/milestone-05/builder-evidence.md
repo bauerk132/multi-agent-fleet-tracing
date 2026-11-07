@@ -60,7 +60,7 @@ reviewing. Summary of the guarantees:
 | `observability/agentscope_importer/__main__.py` | `python -m agentscope_importer` entry |
 | `observability/agentscope_importer/__init__.py` | Public API |
 | `observability/agentscope_importer/README.md` | Operator's view |
-| `observability/tests/test_agentscope_importer.py` | 42 unit tests |
+| `observability/tests/test_agentscope_importer.py` | 44 unit tests |
 | `observability/examples/verify_agentscope_import.py` | Real-import evidence script |
 
 ## The actual AgentScope importer (grounding)
@@ -84,12 +84,14 @@ Full offline suite (`observability/scripts/run_offline_tests.py`,
 repo `.venv`, Python 3.12.3, OTel 1.45.1):
 
 ```
-Ran 135 tests in 54.9s — OK (skipped=2)
+Ran 137 tests in 55.0s — OK (skipped=2)
 ```
 
 - Baseline before M5: 93 run, 92 passed, 1 skipped, 0 failed.
-- New: 42 M5 tests, all passing under the repo venv (1 skip: the
+- New: 44 M5 tests, all passing under the repo venv (1 skip: the
   real-import test, which needs `AGENTSCOPE_SRC` + pydantic).
+  Two of the 44 are regression tests for the idempotency-key gap
+  the double-check pass found and fixed (see build-notes.md).
 - The 2 skips in the full run are the pre-existing live-Claude test
   and the real-import test. No regressions (M1–M4 suites unchanged).
 
@@ -113,7 +115,7 @@ run_ids=['run_629b9f07f1be861d'], idempotent)
 
 The mapped document went through the real `make_importer` /
 `import_bytes` (with `apply_migrations`, as the API does at startup)
-into a temporary data dir. All 42 M5 tests also pass under that
+into a temporary data dir. All 44 M5 tests also pass under that
 interpreter (0 skipped).
 
 ## Staging push
@@ -135,9 +137,15 @@ the double-check section in `build-notes.md`.)
    as `warnings` (the real importer's ladder: anything dropped is a
    warning); a pre-sanitized turn imports as `complete`.
 5. Identical content always returns the original receipt
-   (`already_imported=true`). A deterministic mapping makes the real
-   importer's refused-upgrade path vacuous here, so it is not
-   implemented (documented in the code).
+   (`already_imported=true`) — where "identical" means the same
+   mapped documents AND the same input accounting (unreadable
+   items, dropped runs, mapping notes). The double-check found
+   the first key covered only the documents, so a duplicate-content
+   upload with a bad line returned the original receipt and hid the
+   skipped line; fixed with `_outcome_sha` (see build-notes.md).
+   A deterministic mapping makes the real importer's
+   refused-upgrade path vacuous here, so it is not implemented
+   (documented in the code).
 6. OTLP protobuf is refused, never silently dropped; OTLP/HTTP JSON
    is accepted and flattened with events preserved.
 

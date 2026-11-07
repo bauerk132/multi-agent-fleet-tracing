@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from . import ledger as ledger_mod
@@ -26,7 +26,6 @@ from .contract import (
     MAX_BYTES_PER_IMPORT,
     MAX_IMPORTS,
     MAX_SPANS_PER_IMPORT,
-    PROTOBUF_CONTENT_TYPE,
     SCHEMA_VERSION,
     STATS_KEYS,
 )
@@ -34,7 +33,6 @@ from .mapper import (
     canonical_bytes,
     import_id_for,
     map_spans,
-    ns_to_iso,
     run_id_for,
 )
 
@@ -208,10 +206,47 @@ def _record_receipt(conn, import_row, span_rows, event_rows, run_ids, settings):
     )
 
 
-def _content_sha(documents):
+def _outcome_sha(documents, unreadable, dropped, notes):
+    """Idempotency key for one upload.
+
+    Covers the mapped documents AND the input accounting (unreadable
+    items, dropped runs, mapping notes) — not just the documents.
+    Two uploads that map to the same documents but differ in what was
+    skipped or dropped are different uploads and get distinct
+    receipts; the receipt must describe THIS upload, not an earlier
+    one that happened to map the same way. (Found by the M5
+    double-check: a duplicate-content JSONL upload with one bad line
+    returned the original receipt, hiding the skipped line.)
+    Write-time notes (duplicate_span / span_conflict) are per-upload
+    consequences of ledger state, not input, so they are not part of
+    the key — they are reported in the receipt of the upload that
+    produced them.
+    """
     digest = hashlib.sha256()
     for trace_id, document in sorted(documents, key=lambda item: item[0]):
         digest.update(canonical_bytes(document))
+    accounting = {
+        "unreadable": unreadable,
+        "dropped": sorted(
+            (
+                {"trace_id": d.get("trace_id"), "code": d.get("code")}
+                for d in dropped
+            ),
+            key=lambda d: (d["trace_id"] or "", d["code"] or ""),
+        ),
+        "notes": sorted(
+            (
+                {
+                    "code": n.get("code"),
+                    "message": n.get("message"),
+                    "trace_id": n.get("trace_id"),
+                }
+                for n in notes
+            ),
+            key=lambda n: (n["code"] or "", n["message"] or "", n["trace_id"] or ""),
+        ),
+    }
+    digest.update(json.dumps(accounting, sort_keys=True).encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -354,7 +389,10 @@ def import_spans(conn, spans, producer, settings=None, source="fleet-tracing",
             % (len(spans), settings.max_spans_per_import)
         )
     mapped = map_spans(spans, producer)
-    content_sha256 = _content_sha(mapped["documents"])
+    unreadable = mapped["unreadable"] + unreadable_extra
+    content_sha256 = _outcome_sha(
+        mapped["documents"], unreadable, mapped["dropped"], mapped["notes"]
+    )
     # Spans in dropped runs were read but could not be imported.
     by_trace = {}
     for span in spans:
@@ -477,7 +515,7 @@ def import_canonical_document(conn, document, producer, settings=None,
         canonical_spans.append(span)
     document = dict(document)
     document["spans"] = canonical_spans
-    content_sha256 = hashlib.sha256(canonical_bytes(document)).hexdigest()
+    content_sha256 = _outcome_sha([(trace_id, document)], 0, [], notes)
     existing = ledger_mod.get_import_by_sha(conn, content_sha256)
     if existing is not None:
         existing["already_imported"] = True
