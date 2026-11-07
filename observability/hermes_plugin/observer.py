@@ -286,12 +286,18 @@ class HermesObserver:
             self._count("invalid_events")
             return None
         # Fix Round 5 (FR5-04): human-input events may arrive without a
-        # turn_id (the host raises them outside a turn). turn_id is still
-        # required for every other event type; for human-input events a
-        # stable default is applied below instead of rejecting the event.
+        # turn_id (the host raises them outside a turn). Fix Round 6
+        # (FR6-02): session-boundary events (on_session_finalize /
+        # on_session_reset) are also raised outside a turn — the host
+        # sends session_id, platform, reason and no turn_id. turn_id is
+        # still required for every other event type; for the exempted
+        # events a stable default is applied below instead of rejecting
+        # the event (otherwise _end_session() never runs).
         if event_type not in (
             "on_human_input_request",
             "on_human_input_resolved",
+            "on_session_finalize",
+            "on_session_reset",
         ) and not _valid_id(turn_id):
             self._count("invalid_events")
             return None
@@ -318,6 +324,11 @@ class HermesObserver:
                 clean["request_id"] = (
                     event_id if _valid_id(event_id) else "human-input"
                 )
+        # Fix Round 6 (FR6-02): session-boundary events without a
+        # turn_id get the stable default "session-boundary".
+        if event_type in ("on_session_finalize", "on_session_reset"):
+            if not _valid_id(clean.get("turn_id", "")):
+                clean["turn_id"] = "session-boundary"
         # request_id is required for operation events, optional for
         # session lifecycle events.
         if event_type not in ("on_session_end", "on_session_finalize", "on_session_reset"):

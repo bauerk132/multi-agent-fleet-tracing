@@ -166,3 +166,92 @@ machine). `python3 scripts/run_offline_tests.py` → PASS (same result).
 - M3 acceptance is NOT DECLARED — Fix Round 5 is a builder claim
   (Implemented + Tested), not acceptance. The plugin must NOT be
   enabled in the active Hermes profile until the contract test passes.
+
+---
+
+## Fix Round 6 (2026-11-07) — live Hermes runtime kwargs fixes
+
+**Trigger:** Antigravity's FR5 re-review (handoff hof_01M6V6W8TGKSDSG9CW):
+static contract test passes (`hermes plugins doctor` exit 0, offline
+tests 52/53), but M3 still fails on 6 live Hermes v0.23.0 runtime
+kwargs defects. The builder asked for the exact traces; Antigravity
+sent them in handoff hof_01M6VANB718PNZVHNP (fire sites, live kwarg
+dictionaries, failing traces, targeted fixes). This round implements
+those targeted fixes exactly — no guessed aliases.
+
+**What changed (all in `observability/hermes_plugin/`):**
+
+- **FR6-01 — subagent kwargs mapping** (`__init__.py`,
+  `_event_from_kwargs`): session_id from `('parent_session_id',
+  'session_id', 'session', 'child_session_id',
+  'subagent_session_id', 'agent_session_id')`; turn_id from
+  `('parent_turn_id', 'turn_id', 'turn', 'subagent_turn_id')`;
+  `child_status` checked after `status` for the outcome;
+  parent_request_id from `('parent_subagent_id',
+  'parent_request_id', 'parent_id', 'parent_tool_call_id',
+  'parent_request')` — FR5 aliases kept after the two new keys so
+  the FR5 subagent-parenting test still passes.
+- **FR6-02 — session-boundary turn_id exemption** (`observer.py`,
+  `_validate`): `on_session_finalize` and `on_session_reset` join
+  the turn_id exemption list; missing/invalid turn_id on those
+  events gets the stable default `"session-boundary"`, so
+  `_end_session()` actually runs.
+- **FR6-03 — human-input outcome normalization** (`__init__.py`):
+  a bare `outcome` kwarg outside the bounded enum is normalized
+  through `_map_status_to_outcome` (`'timeout' -> 'timed_out'`,
+  `'error' -> 'observed_failure'`, `'provided' ->
+  'observed_success'` — new `"provided"` entry in
+  `_STATUS_TO_OUTCOME`).
+- **FR6-04 — tool error taxonomy** (`__init__.py`): a bare
+  `error_type` kwarg is normalized through `_map_error_type`
+  (`'tool_error' -> 'ToolError'`), even when `error` is None.
+- **FR6-05 — tool_call_id precedence** (`__init__.py`): for
+  `pre_tool_call` / `post_tool_call`, request_id is picked from
+  `('tool_call_id', 'request_id', 'call_id', 'api_request_id')`;
+  other events keep `('request_id', 'api_request_id',
+  'child_subagent_id', 'subagent_id', 'call_id')`.
+- **FR6-06 — wrapper exception trap** (`__init__.py`): `_callback`
+  wraps mapping + handle in `try/except` and returns `None` on
+  failure — zero exceptions escape into the Hermes host runtime.
+- **Tests:** 6 new tests in
+  `observability/tests/test_hermes_plugin.py`
+  (`test_fr6_subagent_live_kwargs_mapping`,
+  `test_fr6_session_boundary_without_turn_id`,
+  `test_fr6_human_input_outcome_normalization`,
+  `test_fr6_tool_error_type_normalization`,
+  `test_fr6_parallel_tool_call_ids_stay_distinct`,
+  `test_fr6_callback_exception_trap`), each built on the exact live
+  kwargs shapes from hof_01M6VANB718PNZVHNP (unit-level mapping +
+  end-to-end span assertions).
+
+### Test results (2026-11-07)
+
+Command: `python3 observability/scripts/run_offline_tests.py`
+(from the repo root, venv Python 3.12, OTel 1.45.1)
+
+**59 run, 58 passed, 1 skipped, 0 failed, ~36s.**
+
+M3 suite grew 22 → 28 tests (6 new FR6 tests, all passing). M1 (20)
+and M2 (11) suites unchanged and passing; all 8 FR5 plugin tests
+pass unchanged. The 1 skip is the pre-existing live-Claude test (no
+real `claude` binary on this machine).
+`python3 scripts/run_offline_tests.py` → PASS (same result).
+
+### What is still NOT claimed (FR6)
+
+- **Installed Hermes contract: still UNVERIFIED on this VM.** No
+  Hermes build is installed here. The live kwargs contract test
+  (hook delivery with real runtime kwargs in a disposable Hermes
+  profile) is the verification — and per Kyle's 2026-11-07 redirect
+  it is Hermes, not Antigravity, that runs the FR6 re-review.
+- **Subagent stop pairing is an open question for the reviewer**
+  (see fix-rounds.md FR6 notes): the live `subagent_stop` kwargs
+  carry no subagent id, so the stop cannot pair-close the span
+  opened by `subagent_start`; the span is exported as incomplete
+  at turn/session end instead. The builder implemented the
+  handoff's pick orders exactly and did not invent a pairing key.
+- **Windows behavior is verified by reasoning + the reviewer's
+  run, not by executing on Windows on this VM.**
+- M3 acceptance is NOT DECLARED — Fix Round 6 is a builder claim
+  (Implemented + Tested), not acceptance. The plugin must NOT be
+  enabled in the active Hermes profile until the contract test passes.

@@ -88,6 +88,9 @@ _STATUS_TO_OUTCOME = {
     "timed_out": "timed_out",
     "timedout": "timed_out",
     "incomplete": "incomplete",
+    # Fix Round 6 (FR6-03): on_human_input_resolved reports a bare
+    # outcome kwarg; 'provided' means the human answered.
+    "provided": "observed_success",
 }
 
 
@@ -187,14 +190,24 @@ def _event_from_kwargs(event_type, kwargs):
     arguments. A ``payload`` kwarg holding a dict/object is used as a
     fallback source for any field the kwargs do not carry (kwargs win).
 
-    Mappings:
-    - status -> outcome (via _map_status_to_outcome); a bare ``outcome``
-      kwarg already in the bounded enum is passed through; a ``success``
-      bool maps to observed_success / observed_failure.
-    - error dict -> error_type (via _map_error_type).
-    - subagent coordinates: subagent_session_id / session,
-      subagent_turn_id / turn, subagent_id -> session_id / turn_id /
-      request_id; parent_tool_call_id / parent_id -> parent_request_id.
+    Mappings (Fix Round 6: exact live Hermes v0.23.0 kwargs per
+    Antigravity handoff hof_01M6VANB718PNZVHNP):
+    - status -> outcome (via _map_status_to_outcome); child_status
+      (subagent_stop) is checked next; a bare ``outcome`` kwarg already
+      in the bounded enum is passed through, otherwise it is normalized
+      through the status map (FR6-03: 'timeout' -> 'timed_out',
+      'error' -> 'observed_failure', 'provided' -> 'observed_success');
+      a ``success`` bool maps to observed_success / observed_failure.
+    - error dict -> error_type (via _map_error_type); a bare
+      ``error_type`` kwarg is normalized the same way (FR6-04:
+      'tool_error' -> 'ToolError'), even when ``error`` is None.
+    - subagent coordinates (FR6-01): parent_session_id /
+      child_session_id -> session_id, parent_turn_id -> turn_id,
+      child_subagent_id -> request_id, parent_subagent_id ->
+      parent_request_id.
+    - request_id precedence (FR6-05): for pre/post_tool_call
+      tool_call_id wins over api_request_id (parallel tools share one
+      api_request_id); other events keep request_id first.
     - model_name -> model; tool / tool_call_name -> tool_name.
     - event_id defaults to a fresh uuid4 hex when nothing identifies
       the delivery; request_id falls back to the event_id so open/close
@@ -225,24 +238,61 @@ def _event_from_kwargs(event_type, kwargs):
     session_id = str(
         _pick(
             kwargs,
-            ("session_id", "session", "subagent_session_id", "agent_session_id"),
+            (
+                "parent_session_id",
+                "session_id",
+                "session",
+                "child_session_id",
+                "subagent_session_id",
+                "agent_session_id",
+            ),
             base["session_id"],
         )
     )
     turn_id = str(
-        _pick(kwargs, ("turn_id", "turn", "subagent_turn_id"), base["turn_id"])
-    )
-    request_id = str(
         _pick(
             kwargs,
-            ("request_id", "api_request_id", "tool_call_id", "subagent_id", "call_id"),
-            base["request_id"] or event_id,
+            ("parent_turn_id", "turn_id", "turn", "subagent_turn_id"),
+            base["turn_id"],
         )
     )
+    # Fix Round 6 (FR6-05): parallel tool calls share one api_request_id,
+    # so for pre/post_tool_call tool_call_id must win or every parallel
+    # tool collapses onto one dedup key and all but the first are dropped
+    # as duplicates. Other events keep request_id first; subagent ids
+    # (FR6-01) follow api_request_id there.
+    if event_type in ("pre_tool_call", "post_tool_call"):
+        request_id = str(
+            _pick(
+                kwargs,
+                ("tool_call_id", "request_id", "call_id", "api_request_id"),
+                base["request_id"] or event_id,
+            )
+        )
+    else:
+        request_id = str(
+            _pick(
+                kwargs,
+                (
+                    "request_id",
+                    "api_request_id",
+                    "child_subagent_id",
+                    "subagent_id",
+                    "call_id",
+                ),
+                base["request_id"] or event_id,
+            )
+        )
     parent_request_id = str(
         _pick(
             kwargs,
-            ("parent_request_id", "parent_id", "parent_tool_call_id", "parent_request"),
+            (
+                "parent_subagent_id",
+                "parent_request_id",
+                "parent_id",
+                "parent_tool_call_id",
+                "parent_request",
+            ),
             base["parent_request_id"],
         )
     )
@@ -252,14 +302,21 @@ def _event_from_kwargs(event_type, kwargs):
     except (TypeError, ValueError):
         attempt = 1
 
-    # outcome: status wins, then a bare outcome kwarg, then success bool.
+    # outcome: status wins, then child_status (subagent_stop, FR6-01),
+    # then a bare outcome kwarg, then success bool.
     outcome = None
     if "status" in kwargs and kwargs["status"] is not None:
         outcome = _map_status_to_outcome(kwargs["status"])
+    elif kwargs.get("child_status") is not None:
+        outcome = _map_status_to_outcome(kwargs["child_status"])
     elif kwargs.get("outcome") in _OUTCOMES:
         outcome = kwargs["outcome"]
     elif kwargs.get("outcome") is not None:
-        outcome = "unknown"
+        # Fix Round 6 (FR6-03): a bare outcome kwarg outside the bounded
+        # enum (e.g. on_human_input_resolved 'timeout' / 'error' /
+        # 'provided') is normalized through the status map instead of
+        # degrading to 'unknown'.
+        outcome = _map_status_to_outcome(kwargs["outcome"])
     elif isinstance(kwargs.get("success"), bool):
         outcome = "observed_success" if kwargs["success"] else "observed_failure"
     else:
@@ -270,7 +327,11 @@ def _event_from_kwargs(event_type, kwargs):
     if kwargs.get("error") is not None:
         error_type = _map_error_type(kwargs["error"])
     elif kwargs.get("error_type") is not None:
-        error_type = kwargs["error_type"]
+        # Fix Round 6 (FR6-04): a bare error_type kwarg (e.g.
+        # post_tool_call 'tool_error' with error=None) is normalized
+        # through the taxonomy instead of passing the raw string through
+        # to validation, where it would degrade to 'Unknown'.
+        error_type = _map_error_type(kwargs["error_type"])
     else:
         error_type = base["error_type"]
 
@@ -337,7 +398,14 @@ def register(ctx):
 
     def _make_callback(event_type):
         def _callback(**kwargs):
-            observer.handle_event(_event_from_kwargs(event_type, kwargs))
+            # Fix Round 6 (FR6-06): nothing from the observer may escape
+            # into the Hermes host runtime. handle_event never raises,
+            # and this trap covers the kwargs -> event mapping step as
+            # well. A mapping failure is swallowed, never raised.
+            try:
+                observer.handle_event(_event_from_kwargs(event_type, kwargs))
+            except Exception:
+                pass
             return None
 
         return _callback
