@@ -88,9 +88,15 @@ on the FR8-02 test — then restoring the fix).
 
 ## Commits
 
-- Local commit: (recorded after commit).
-- Staging push (snapshot-push): (recorded after push); parent
-  `93638f52` (FR7).
+- Local commit: `8cb7737` ("Fix Round 8 (M4): log spanContext
+  poisoning, keyed lazy-root native context").
+- Staging push (snapshot-push):
+  `68b53aee5bbfd6dde71acaf9477cb023f2f1d78f` ("Fix Round 8 (M4):
+  ..."), verified as the staging head via `list_commits`; parent
+  `93638f52` (FR7). Sync record updated (14 entries). This SHA was
+  recorded in a local commit after the push; it rides along on the
+  next snapshot push (recording it cannot be part of the pushed
+  tree itself).
 - Previous staging head: `93638f52` (FR7).
 
 ## Acceptance
