@@ -145,7 +145,8 @@ specified.
 
 ## Commits
 
-- Local commit: _TBD (filled in after commit)_.
+- Local commit: `a66f687` ("Fix Round 7 (M4): real FileSpanExporter
+  JSONL shape, child-before-root ordering, keyed lazy roots").
 - Staging push (snapshot-push): _TBD (filled in after push)_.
 - Previous staging head: `865410be` (M4).
 
