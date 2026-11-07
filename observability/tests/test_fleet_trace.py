@@ -96,7 +96,11 @@ def _emit_span(endpoint, service_name, name, attributes, status_error=False):
     provider.add_span_processor(SimpleSpanProcessor(OTLPJSONExporter(endpoint)))
     tracer = provider.get_tracer("fleet.test", "1.0.0")
     with tracer.start_as_current_span(
-        name, kind=SpanKind.INTERNAL, attributes=sanitize_attributes(attributes)
+        name,
+        kind=SpanKind.INTERNAL,
+        attributes=sanitize_attributes(attributes),
+        record_exception=False,
+        set_status_on_exception=False,
     ) as span:
         ctx = span.get_span_context()
         trace_id, span_id = format_trace_id(ctx.trace_id), format_span_id(ctx.span_id)
@@ -505,6 +509,90 @@ class FleetTraceTestCase(unittest.TestCase):
         self.assertTrue(report_bad.get("ok"), f"child failed: {report_bad}")
         self.assertFalse(report_bad.get("parented"))
         self.assertIsNone(report_bad.get("parent_span_id"))
+
+    # -- unparented branch never inherits an ambient span (Fix Round 4,
+    # M3 entry P1, Sol §12/§13) -----------------------------------------
+    def test_unparented_context_ignores_ambient_span(self):
+        from child import resolve_parent_context
+        from opentelemetry import context as otel_context
+        from opentelemetry import trace as otel_trace
+        from opentelemetry.trace import (
+            NonRecordingSpan,
+            SpanContext,
+            set_span_in_context,
+        )
+
+        # An ambient span exists in this process (simulating a host that
+        # already has a current span). With no valid TRACEPARENT the
+        # resolver must return an explicit empty Context(), never the
+        # ambient span — otherwise the child would falsely parent to
+        # unrelated work.
+        ambient = NonRecordingSpan(
+            SpanContext(
+                trace_id=int("a" * 32, 16),
+                span_id=int("b" * 16, 16),
+                is_remote=False,
+            )
+        )
+        token = otel_context.attach(set_span_in_context(ambient))
+        try:
+            os.environ.pop("TRACEPARENT", None)
+            os.environ.pop("TRACESTATE", None)
+            os.environ.pop("BAGGAGE", None)
+            ctx, parented, parent_span_id, _ = resolve_parent_context()
+            self.assertFalse(parented)
+            self.assertIsNone(parent_span_id)
+            current = otel_trace.get_current_span(ctx)
+            self.assertFalse(current.get_span_context().is_valid)
+        finally:
+            otel_context.detach(token)
+
+    # -- exception text never leaks into serialized OTLP (Fix Round 4,
+    # M3 entry P1, Sol §12/§13) -----------------------------------------
+    def test_exception_privacy_no_leak(self):
+        import time
+
+        import fleet_trace
+
+        canary = "CANARY-EXC-999"
+        with mock.patch(
+            "fleet_trace.spawn_controlled_child",
+            side_effect=RuntimeError(f"boom {canary}"),
+        ):
+            with self.assertRaises(RuntimeError):
+                run_intent(self.endpoint, "fleet-test-coordinator", CHILD_PATH)
+        # The BatchSpanProcessor exports on its 1s schedule even though
+        # run_intent never reached its explicit flush; wait for the
+        # spans, then require them to have arrived AND the canary to be
+        # absent (non-vacuous: no spans would also mean no canary).
+        deadline = time.time() + 5.0
+        got = []
+        while time.time() < deadline:
+            got = [
+                s
+                for s in self._spans()
+                if (s.get("resource") or {}).get("service.name")
+                == "fleet-test-coordinator"
+            ]
+            if got:
+                break
+            time.sleep(0.2)
+        self.assertTrue(got, "no coordinator spans arrived after exception")
+        blob = json.dumps(self.recv.payloads)
+        self.assertNotIn(canary, blob)
+
+    def test_all_owned_spans_disable_exception_recording(self):
+        # Fix Round 4 (M3 entry P1): every start_as_current_span in our
+        # code must carry record_exception=False, or a future scope could
+        # silently reintroduce the exception-text leak. Static guard over
+        # the three modules (counts must match exactly).
+        for rel in ("child.py", "fleet_trace.py", "claude_child.py"):
+            src = (HERE / rel).read_text()
+            self.assertEqual(
+                src.count("start_as_current_span("),
+                src.count("record_exception=False"),
+                f"{rel}: span scopes without exception-recording disabled",
+            )
 
     # -- external agent links back via span link (Fix Round 1, G1-P1-02) -----
     def test_external_agent_span_link(self):

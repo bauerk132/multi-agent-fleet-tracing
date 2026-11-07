@@ -34,6 +34,7 @@ import sys
 
 from opentelemetry import propagate, trace
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
+from opentelemetry.context import Context
 from opentelemetry.propagators.composite import CompositePropagator
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -53,10 +54,46 @@ def _log(*args):
 # the propagator, so the child never parents to a garbage context.
 _TRACEPARENT_RE = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
 
+# Explicit extractor (not the process-global textmap) so the extraction
+# logic is directly testable without global state.
+_EXTRACTOR = CompositePropagator(
+    [TraceContextTextMapPropagator(), W3CBaggagePropagator()]
+)
+
 
 def is_valid_traceparent(value):
     """True only for a well-formed W3C traceparent (version 00)."""
     return bool(value) and bool(_TRACEPARENT_RE.match(value))
+
+
+def resolve_parent_context():
+    """Extract the W3C parent context from the environment.
+
+    Returns (ctx, parented, parent_span_id, parent_trace_id).
+
+    Fix Round 4 (M3 entry P1, Sol §12/§13): the unparented branch
+    returns an explicit empty Context() — never context=None, which
+    would inherit an ambient current span and falsely parent unrelated
+    work. The carrier uses lowercase keys (the propagator's getter is
+    case-sensitive); a malformed TRACEPARENT is dropped (G2-P3-01).
+    """
+    if "TRACEPARENT" in os.environ and not is_valid_traceparent(
+        os.environ["TRACEPARENT"]
+    ):
+        _log("child: rejecting malformed TRACEPARENT")
+        del os.environ["TRACEPARENT"]
+    carrier = {
+        key.lower(): os.environ[key]
+        for key in ("TRACEPARENT", "TRACESTATE", "BAGGAGE")
+        if key in os.environ
+    }
+    ctx = _EXTRACTOR.extract(carrier)
+    parent_ctx = trace.get_current_span(ctx).get_span_context()
+    parented = bool(parent_ctx.is_valid and parent_ctx.is_remote)
+    parent_span_id = format_span_id(parent_ctx.span_id) if parented else None
+    parent_trace_id = format_trace_id(parent_ctx.trace_id) if parent_ctx.is_valid else None
+    _log(f"child: extracted parented={parented} parent_span_id={parent_span_id}")
+    return (ctx if parented else Context(), parented, parent_span_id, parent_trace_id)
 
 
 def main():
@@ -72,25 +109,10 @@ def main():
 
     # --- Child extraction (S1 fix): extract, then validate. ---
     # W3C header names are lowercase ("traceparent"); env vars are
-    # uppercase ("TRACEPARENT"). The propagator's getter is case-sensitive,
-    # so the carrier must use lowercase keys. A malformed TRACEPARENT is
-    # dropped here (G2-P3-01) instead of reaching the propagator.
-    if "TRACEPARENT" in os.environ and not is_valid_traceparent(
-        os.environ["TRACEPARENT"]
-    ):
-        _log("child: rejecting malformed TRACEPARENT")
-        del os.environ["TRACEPARENT"]
-    carrier = {
-        key.lower(): os.environ[key]
-        for key in ("TRACEPARENT", "TRACESTATE", "BAGGAGE")
-        if key in os.environ
-    }
-    ctx = propagate.extract(carrier)
-    parent_ctx = trace.get_current_span(ctx).get_span_context()
-    parented = bool(parent_ctx.is_valid and parent_ctx.is_remote)
-    parent_span_id = format_span_id(parent_ctx.span_id) if parented else None
-    parent_trace_id = format_trace_id(parent_ctx.trace_id) if parent_ctx.is_valid else None
-    _log(f"child: extracted parented={parented} parent_span_id={parent_span_id}")
+    # uppercase ("TRACEPARENT"). See resolve_parent_context().
+    (parent_ctx, parented, parent_span_id, parent_trace_id) = (
+        resolve_parent_context()
+    )
 
     exporter = OTLPJSONExporter(endpoint) if endpoint else NullExporter()
     provider = TracerProvider(
@@ -109,10 +131,15 @@ def main():
     }
     # A child that is NOT parented runs as a new root and correlates only
     # via task/session IDs — it must never claim the coordinator's parent.
+    # parent_ctx is an explicit empty Context() when unparented (never
+    # None — None would inherit an ambient span). See
+    # resolve_parent_context().
     with tracer.start_as_current_span(
         "agent.run",
-        context=ctx if parented else None,
+        context=parent_ctx,
         kind=SpanKind.INTERNAL,
+        record_exception=False,
+        set_status_on_exception=False,
         attributes=dict(base_attrs),
     ) as run_span:
         run_ctx = run_span.get_span_context()
@@ -121,6 +148,8 @@ def main():
         with tracer.start_as_current_span(
             "llm.call",
             kind=SpanKind.INTERNAL,
+        record_exception=False,
+        set_status_on_exception=False,
             attributes={
                 **base_attrs,
                 "gen_ai.provider.name": "controlled-child",
@@ -132,6 +161,8 @@ def main():
             with tracer.start_as_current_span(
                 "tool.exec",
                 kind=SpanKind.INTERNAL,
+        record_exception=False,
+        set_status_on_exception=False,
                 attributes={**base_attrs, "gen_ai.tool.name": "Bash"},
             ):
                 pass  # simulated tool work; no real command executed
