@@ -147,7 +147,12 @@ specified.
 
 - Local commit: `a66f687` ("Fix Round 7 (M4): real FileSpanExporter
   JSONL shape, child-before-root ordering, keyed lazy roots").
-- Staging push (snapshot-push): _TBD (filled in after push)_.
+- Staging push (snapshot-push): `93638f52a181ef83d7d5a339ef5a49274c2070a3`
+  ("Fix Round 7 (M4): ..."), verified as the staging head via
+  `list_commits`; parent `865410be` (M4). Sync record updated (13
+  entries). This SHA was recorded in a local commit after the push;
+  it rides along on the next snapshot push (recording it cannot be
+  part of the pushed tree itself).
 - Previous staging head: `865410be` (M4).
 
 ## Acceptance
