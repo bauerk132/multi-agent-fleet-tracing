@@ -766,6 +766,27 @@ class CopilotObserver:
                         continue
                     if "resourceSpans" in obj:
                         collected.extend(flatten_payload(obj))
+                    elif (
+                        "resourceMetrics" in obj
+                        or "resourceLogs" in obj
+                        or "scopeMetrics" in obj
+                        or "scopeLogs" in obj
+                        or obj.get("type") in ("metric", "log")
+                        or "dataPoints" in obj
+                        or "hrTime" in obj
+                        or "hrTimeObserved" in obj
+                        or "severityNumber" in obj
+                        or "severityText" in obj
+                    ):
+                        # FileLogExporter / FileMetricExporter lines.
+                        # A log record carries a spanContext while its
+                        # span is still active, so this skip MUST run
+                        # before the span branches below: otherwise the
+                        # log is collected as a span, fails
+                        # _operation_of, and poisons _seen for the real
+                        # span that shares its ids (FR8-01).
+                        summary["skipped_non_trace"] += 1
+                        self._count("ingest_lines_skipped")
                     elif "traceId" in obj and "spanId" in obj:
                         collected.append(obj)
                     elif (
@@ -775,17 +796,6 @@ class CopilotObserver:
                     ):
                         # ReadableSpan line: spanContext carries the ids.
                         collected.append(obj)
-                    elif (
-                        "resourceMetrics" in obj
-                        or "resourceLogs" in obj
-                        or "scopeMetrics" in obj
-                        or "scopeLogs" in obj
-                        or obj.get("type") == "metric"
-                        or "dataPoints" in obj
-                        or ("hrTime" in obj and "body" in obj)
-                    ):
-                        summary["skipped_non_trace"] += 1
-                        self._count("ingest_lines_skipped")
                     else:
                         summary["invalid_lines"] += 1
                         self._count("ingest_lines_invalid")
@@ -831,13 +841,6 @@ class CopilotObserver:
             trace_id = trace_id.lower()
             span_id = span_id.lower()
             key = (trace_id, span_id)
-            with self._lock:
-                if key in self._seen:
-                    self._counters["duplicates"] += 1
-                    continue
-                if len(self._seen) > MAX_SEEN:
-                    self._seen.pop(next(iter(self._seen)))
-                self._seen[key] = time.time()
             attrs = span.get("attributes") or {}
             resource = span.get("resource") or {}
             service = resource.get("service.name")
@@ -861,6 +864,16 @@ class CopilotObserver:
             if op is None:
                 self._count("unknown_operation")
                 continue
+            # Dedup AFTER the scope/operation filters: a rejected or
+            # unknown-operation object must never poison _seen for the
+            # real span that shares its ids (FR8-01).
+            with self._lock:
+                if key in self._seen:
+                    self._counters["duplicates"] += 1
+                    continue
+                if len(self._seen) > MAX_SEEN:
+                    self._seen.pop(next(iter(self._seen)))
+                self._seen[key] = time.time()
             parent_id = span.get("parentSpanId") or ""
             if parent_id and not _valid_span_id(parent_id):
                 parent_id = ""
@@ -1142,6 +1155,15 @@ class CopilotObserver:
             "created_wall": time.time(),
         }
         self._turn_roots[key] = root
+        if root_key:
+            # Keyed lazy root: register the native context so direct
+            # child spans arriving in later streaming batches resolve
+            # their parent instead of counting parent_unresolved
+            # (FR8-02). The real invoke_agent overwrites this entry
+            # with its own context when it folds the lazy root.
+            if len(self._native_contexts) > MAX_NATIVE_INDEX:
+                self._native_contexts.pop(next(iter(self._native_contexts)))
+            self._native_contexts[(trace_id, root_key)] = ctx
         return root
 
     def _process_invoke_agent(self, span, trace_id, span_id):
