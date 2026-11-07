@@ -91,11 +91,19 @@ SAFE_ATTRIBUTE_KEYS = frozenset(
         "retrieval.query_ref",
         "approval.kind",
         "synthetic",
+        # Milestone 3 (Hermes observer, schema v1): turn/request correlation,
+        # observation provenance/completeness, and retry attempt. All are
+        # opaque IDs or bounded enums — no content fields.
+        "turn.id",
+        "request.id",
+        "observation.source",
+        "observation.completeness",
+        "hermes.attempt",
     }
 )
 
 # Bounded safe enums for error metadata. No exception str(e), no tracebacks.
-SAFE_ERROR_TYPES = frozenset({"ToolError", "ChildProcessFailure", "LLMError", "Timeout"})
+SAFE_ERROR_TYPES = frozenset({"ToolError", "ChildProcessFailure", "LLMError", "Timeout", "Cancelled", "Unknown"})
 SAFE_ERROR_MESSAGES = frozenset(
     {
         "Tool failed; details withheld",
