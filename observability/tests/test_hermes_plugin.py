@@ -5,6 +5,13 @@ python_dependencies + missing-OTel guard (FR5-02), **kwargs callbacks
 (FR5-03), kwargs -> schema-v1 mapping (FR5-04), provides_hooks +
 manifest parity (FR5-05).
 
+Plus the six FR6 findings (exact live Hermes v0.23.0 kwargs per
+Antigravity handoff hof_01M6VANB718PNZVHNP): subagent kwargs mapping
+(FR6-01), session-boundary turn_id exemption (FR6-02), human-input
+outcome normalization (FR6-03), tool error taxonomy (FR6-04),
+tool_call_id precedence for parallel tools (FR6-05), callback
+exception trap (FR6-06).
+
 The two isolation tests (staged copy, missing OTel) run in a subprocess
 so the parent process's sys.path / installed OTel cannot mask a failure.
 
@@ -374,6 +381,220 @@ class HermesPluginTestCase(unittest.TestCase):
         self.assertIn("GUARD-OK", proc.stdout)
         self.assertNotIn("Traceback", proc.stdout + proc.stderr)
         self.assertNotIn("GUARD-FAIL", proc.stdout + proc.stderr)
+
+    # -- FR6-01: live subagent kwargs (Hermes v0.23.0) ---------------------
+    def test_fr6_subagent_live_kwargs_mapping(self):
+        # Unit-level: exact live kwargs from tools/delegate_tool.py:356
+        # (subagent_start) and tools/delegate_tool_results.py:382
+        # (subagent_stop), per handoff hof_01M6VANB718PNZVHNP.
+        start = _event_from_kwargs(
+            "subagent_start",
+            {
+                "parent_session_id": "ps-1",
+                "parent_turn_id": "pt-1",
+                "parent_subagent_id": "par-1",
+                "child_session_id": "cs-1",
+                "child_subagent_id": "child-1",
+                "child_role": "coder",
+                "child_goal": "fix bug",
+            },
+        )
+        self.assertEqual(start["session_id"], "ps-1")
+        self.assertEqual(start["turn_id"], "pt-1")
+        self.assertEqual(start["request_id"], "child-1")
+        self.assertEqual(start["parent_request_id"], "par-1")
+        stop = _event_from_kwargs(
+            "subagent_stop",
+            {
+                "parent_session_id": "ps-1",
+                "parent_turn_id": "pt-1",
+                "child_session_id": "cs-1",
+                "child_role": "coder",
+                "child_summary": "done",
+                "child_status": "completed",
+                "duration_ms": 1234,
+            },
+        )
+        self.assertEqual(stop["session_id"], "ps-1")
+        self.assertEqual(stop["turn_id"], "pt-1")
+        self.assertEqual(stop["outcome"], "observed_success")
+        # End to end: both live-shaped events are accepted, none invalid,
+        # and the span is exported (reconciled incomplete at turn end —
+        # the live stop carries no subagent id, so it cannot pair-close
+        # the span opened by the start; see fix-rounds.md FR6 notes).
+        self.ctx.hooks["subagent_start"](
+            parent_session_id="ps-1", parent_turn_id="pt-1",
+            parent_subagent_id="par-1", child_session_id="cs-1",
+            child_subagent_id="child-1", child_role="coder",
+            child_goal="fix bug",
+        )
+        self.ctx.hooks["subagent_stop"](
+            parent_session_id="ps-1", parent_turn_id="pt-1",
+            child_session_id="cs-1", child_role="coder",
+            child_summary="done", child_status="completed",
+            duration_ms=1234,
+        )
+        self._deliver_session_end(session="ps-1", turn="pt-1")
+        diag = self.observer.diagnostics()
+        self.assertEqual(diag["accepted"], 3, diag)
+        self.assertEqual(diag["invalid_events"], 0, diag)
+        subs = self._spans_named("subagent.spawn")
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["attributes"]["session.id"], "ps-1")
+        self.assertEqual(subs[0]["attributes"]["turn.id"], "pt-1")
+        self.assertEqual(subs[0]["attributes"]["request.id"], "child-1")
+        self.assertEqual(
+            subs[0]["attributes"]["observation.completeness"], "incomplete"
+        )
+
+    # -- FR6-02: session boundaries without turn_id ------------------------
+    def test_fr6_session_boundary_without_turn_id(self):
+        # Live kwargs shape (lifecycle.py / cli_session_mixin.py):
+        # session_id, platform, reason — no turn_id is sent.
+        self.ctx.hooks["pre_tool_call"](
+            session_id="s1", turn_id="t1", request_id="req-b-1", tool_name="Bash"
+        )
+        self.ctx.hooks["on_session_finalize"](
+            session_id="s1", platform="darwin", reason="shutdown"
+        )
+        self.ctx.hooks["on_session_reset"](
+            session_id="s1", platform="darwin", reason="reset"
+        )
+        self.assertTrue(self.observer.drain(timeout=5.0))
+        diag = self.observer.diagnostics()
+        self.assertEqual(diag["accepted"], 3, diag)
+        self.assertEqual(diag["invalid_events"], 0, diag)
+        # _end_session ran: the orphaned tool span was closed incomplete.
+        tools = self._spans_named("tool.exec")
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(
+            tools[0]["attributes"]["observation.completeness"], "incomplete"
+        )
+
+    # -- FR6-03: human-input bare outcome normalization --------------------
+    def test_fr6_human_input_outcome_normalization(self):
+        # Unit-level: exact live kwargs from human_input_hooks.py:72 —
+        # a bare outcome kwarg, no status kwarg.
+        cases = {
+            "timeout": "timed_out",
+            "error": "observed_failure",
+            "cancelled": "cancelled",
+            "provided": "observed_success",
+        }
+        for raw, expected in cases.items():
+            evt = _event_from_kwargs(
+                "on_human_input_resolved",
+                {"request_id": "hr-1", "session_id": "s1", "outcome": raw},
+            )
+            self.assertEqual(evt["outcome"], expected, raw)
+        # End to end: a timed-out approval closes with ERROR status.
+        self.ctx.hooks["on_human_input_request"](
+            session_id="s1", request_id="hr-1"
+        )
+        self.ctx.hooks["on_human_input_resolved"](
+            session_id="s1", request_id="hr-1", outcome="timeout"
+        )
+        self._deliver_session_end(turn="human-input")
+        approvals = self._spans_named("approval.wait")
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["status"]["code"], 2)  # ERROR
+        self.assertEqual(self.observer.diagnostics()["accepted"], 3)
+
+    # -- FR6-04: tool error_type normalization ------------------------------
+    def test_fr6_tool_error_type_normalization(self):
+        # Unit-level: exact live kwargs from model_tools.py:704 —
+        # error=None, error_type='tool_error' as a bare string.
+        evt = _event_from_kwargs(
+            "post_tool_call",
+            {
+                "session_id": "s1",
+                "turn_id": "t1",
+                "tool_call_id": "tc-1",
+                "tool_name": "Bash",
+                "status": "error",
+                "error_type": "tool_error",
+                "error_message": "exit 1",
+                "error": None,
+            },
+        )
+        self.assertEqual(evt["error_type"], "ToolError")
+        self.assertEqual(evt["outcome"], "observed_failure")
+        self.assertEqual(evt["request_id"], "tc-1")
+        # End to end: the closed span carries error.type ToolError.
+        self.ctx.hooks["pre_tool_call"](
+            session_id="s1", turn_id="t1", tool_call_id="tc-1", tool_name="Bash"
+        )
+        self.ctx.hooks["post_tool_call"](
+            session_id="s1", turn_id="t1", tool_call_id="tc-1",
+            status="error", error_type="tool_error",
+            error_message="exit 1", error=None,
+        )
+        self._deliver_session_end()
+        tools = self._spans_named("tool.exec")
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["status"]["code"], 2)  # ERROR
+        self.assertEqual(tools[0]["attributes"]["error.type"], "ToolError")
+
+    # -- FR6-05: parallel tools keep distinct request_ids ------------------
+    def test_fr6_parallel_tool_call_ids_stay_distinct(self):
+        # Unit-level: same api_request_id, different tool_call_ids.
+        shared = {
+            "session_id": "s1",
+            "turn_id": "t1",
+            "api_request_id": "api-shared",
+        }
+        a = _event_from_kwargs(
+            "pre_tool_call", {**shared, "tool_call_id": "tc-a", "tool_name": "Bash"}
+        )
+        b = _event_from_kwargs(
+            "pre_tool_call", {**shared, "tool_call_id": "tc-b", "tool_name": "Read"}
+        )
+        self.assertEqual(a["request_id"], "tc-a")
+        self.assertEqual(b["request_id"], "tc-b")
+        # Non-tool events keep request_id first.
+        api = _event_from_kwargs(
+            "pre_api_request", {**shared, "request_id": "req-api-1"}
+        )
+        self.assertEqual(api["request_id"], "req-api-1")
+        # End to end: two parallel tools sharing one api_request_id both
+        # export as distinct spans — no dedup collapse.
+        for call_id, tool in (("tc-a", "Bash"), ("tc-b", "Read")):
+            self.ctx.hooks["pre_tool_call"](
+                session_id="s1", turn_id="t1", tool_call_id=call_id,
+                api_request_id="api-shared", tool_name=tool,
+            )
+        for call_id in ("tc-a", "tc-b"):
+            self.ctx.hooks["post_tool_call"](
+                session_id="s1", turn_id="t1", tool_call_id=call_id,
+                api_request_id="api-shared", status="success",
+            )
+        self._deliver_session_end()
+        diag = self.observer.diagnostics()
+        self.assertEqual(diag["duplicates"], 0, diag)
+        tools = self._spans_named("tool.exec")
+        self.assertEqual(len(tools), 2)
+        self.assertEqual(
+            sorted(t["attributes"]["request.id"] for t in tools), ["tc-a", "tc-b"]
+        )
+
+    # -- FR6-06: callback exception trap ------------------------------------
+    def test_fr6_callback_exception_trap(self):
+        # An unhashable outcome value breaks the `in _OUTCOMES` check
+        # inside the mapping step; the callback must swallow it and
+        # return None instead of raising into the host.
+        result = self.ctx.hooks["on_human_input_resolved"](
+            session_id="s1", request_id="hr-trap-1",
+            outcome=["not", "a", "string"],
+        )
+        self.assertIsNone(result)
+        diag = self.observer.diagnostics()
+        self.assertEqual(diag["accepted"], 0, diag)
+        # Normal delivery still works afterwards.
+        self.ctx.hooks["pre_tool_call"](
+            session_id="s1", turn_id="t1", request_id="req-trap-1",
+            tool_name="Bash",
+        )
+        self.assertEqual(self.observer.diagnostics()["accepted"], 1)
 
 
 if __name__ == "__main__":
