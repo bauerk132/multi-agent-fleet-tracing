@@ -25,12 +25,30 @@ Run from observability/:
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
 OBS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(OBS))
-sys.path.insert(0, "/home/hatch/workspace/agent-trace-collector")
+
+# The AgentScope collector lives outside this repo. Its checkout path
+# is configurable via AGENTSCOPE_SRC so this script also runs on
+# Windows, where the Linux default below does not exist. If the
+# collector is absent, fail with a clear message instead of a raw
+# ImportError traceback. (FR7-06)
+AGENTSCOPE_SRC = Path(
+    os.environ.get("AGENTSCOPE_SRC", "/home/hatch/workspace/agent-trace-collector")
+)
+if AGENTSCOPE_SRC.is_dir():
+    sys.path.insert(0, str(AGENTSCOPE_SRC))
+else:
+    print(
+        "AgentScope collector not found at %s; set AGENTSCOPE_SRC to the "
+        "agent-trace-collector checkout and retry." % AGENTSCOPE_SRC,
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 from agentscope.feed import build_feed
 from collector.spans import Span

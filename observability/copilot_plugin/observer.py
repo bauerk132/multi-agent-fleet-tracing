@@ -47,24 +47,29 @@ What is NOT observable / NOT claimed:
 - Claude agent spans (``gen_ai.agent.name`` == "claude", service
   ``claude-code``) are out of scope — Claude Code has its own M2 path.
   They are dropped and counted, never emitted as Copilot spans.
-- OTLP/protobuf: Copilot's default exporter is http/protobuf. The
-  local receiver speaks OTLP/HTTP JSON, so the verified local loop is
-  the FILE exporter (``github.copilot.chat.otel.outfile`` /
-  ``COPILOT_OTEL_FILE_EXPORTER_PATH``, JSON lines). The exact JSONL
-  line shape is NOT documented — ``ingest_jsonl`` defensively accepts
-  both a full OTLP payload per line and a single flattened span per
-  line; the reviewer must confirm the real line shape on the installed
-  build (contract test). The SQLite dbSpanExporter path is not
-  implemented (schema undocumented).
+- OTLP/HTTP JSON: copilot-chat v0.73.0 defaults the otlp-http
+  exporter protocol to http/json, so the local receiver accepts it;
+  earlier versions defaulted to protobuf. The verified local loop
+  is the FILE exporter (``github.copilot.chat.otel.outfile`` /
+  ``COPILOT_OTEL_FILE_EXPORTER_PATH``, JSON lines). Each line is one
+  ReadableSpan JSON object (``spanContext`` / ``parentSpanContext``,
+  HrTime ``startTime``/``endTime`` arrays, nested
+  ``resource.attributes``) — see config.md; ``ingest_jsonl`` also
+  accepts a full OTLP payload per line and a single flattened span
+  per line, and skips metric/log lines (never errors). The SQLite
+  dbSpanExporter path is not implemented (schema undocumented).
 
 Ingestion (both entry points are off-path, never raise, never block):
 - ``handle_payload(payload)`` — an OTLP/HTTP JSON payload
   (``resourceSpans``), the same shape ``receiver.flatten_payload``
   produces. Used by tests and by any JSON-speaking exporter/collector
   wired in front of the adapter.
-- ``ingest_jsonl(path)`` — the documented file exporter: one JSON
-  line per signal. Lines that are metrics/logs payloads are skipped
-  and counted, never treated as errors.
+- ``ingest_jsonl(path)`` — the documented file exporter: one
+  ReadableSpan JSON value per line (see config.md). Metric/log lines
+  are skipped and counted, never treated as errors. Span lines are
+  collected across the file and handed to ``handle_spans`` in one
+  batch so parents order before children even when the file lists
+  children first.
 - The adapter performs NO network I/O on the ingest path: ingest only
   validates and enqueues. A single worker thread owns span lifecycle
   and export (off-path), same as M3.
@@ -141,6 +146,8 @@ COPILOT_SERVICES = frozenset({"copilot-chat", "github-copilot"})
 # Content-capture attributes: never collected, never emitted. Present in
 # a native span they are stripped and counted. (Also covers the M3
 # generic content fields as a safety net — see DENIED_FIELDS.)
+# FR7-05: real copilot-chat v0.73.0 / SDK content keys, so
+# stripped_fields counts them when they arrive.
 CONTENT_ATTRIBUTES = frozenset(
     {
         "gen_ai.input.messages",
@@ -153,13 +160,34 @@ CONTENT_ATTRIBUTES = frozenset(
         "github.copilot.tool.parameters.mcp_server_name",
         "copilot_chat.hook_input",
         "copilot_chat.hook_output",
+        "copilot_chat.user_request",
+        "copilot_chat.hook_command",
+        "copilot_chat.file.relative_path",
+        "gen_ai.system_instructions",
+        "gen_ai.tool.description",
+        "gen_ai.agent.description",
+        "copilot_chat.reasoning_content",
+        "copilot_chat.prompt_context",
+        "copilot_chat.prompt_instructions",
+        "copilot_chat.markdown_content",
+        "copilot_chat.event_details",
+        "github.copilot.skill.content",
+        "github.copilot.elicitation.message",
+        "github.copilot.hook.error_message",
     }
 )
 
 # Identity attributes: only emitted when identity capture is opted in
 # (Local harness sessions). The adapter never enables it and strips
 # these keys if they arrive.
-IDENTITY_ATTRIBUTES = frozenset({"user.name", "process.user.name", "host.name"})
+IDENTITY_ATTRIBUTES = frozenset(
+    {
+        "user.name",
+        "process.user.name",
+        "host.name",
+        "enduser.pseudo.id",
+    }
+)
 
 # Identifying repo attributes: the repository remote URL and GitHub org
 # identify the user's work and are not needed for tracing. Branch and
@@ -169,6 +197,11 @@ REPO_ATTRIBUTES = frozenset(
         "github.copilot.git.repository",
         "github.copilot.github.org",
         "copilot_chat.repo.remote_url",
+        "github.copilot.cwd",
+        "github.copilot.git_root",
+        "github.copilot.repository",
+        "github.copilot.skill.path",
+        "github.copilot.mcp.server.name",
     }
 )
 
@@ -274,7 +307,12 @@ def _parse_float(value):
 
 
 def _attrs_to_dict(attrs):
-    """Convert an OTLP attribute list to a plain {key: value} dict."""
+    """Convert an OTLP attribute list to a plain {key: value} dict.
+
+    A flat dict passes through unchanged (ReadableSpan shape).
+    """
+    if isinstance(attrs, dict):
+        return dict(attrs)
     out = {}
     for attr in attrs or []:
         key = attr.get("key")
@@ -300,6 +338,149 @@ def _attrs_to_dict(attrs):
     return out
 
 
+def _attr_first(attrs, *keys):
+    """First present (non-None) value across attribute aliases."""
+    for key in keys:
+        value = (attrs or {}).get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _hrtime_to_ns(value):
+    """OTel JS HrTime [seconds, nanoseconds] -> Unix nanoseconds.
+
+    The FileSpanExporter writes startTime/endTime as HrTime arrays;
+    returns None for anything else. (FR7-01)
+    """
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        sec = _parse_int(value[0])
+        nsec = _parse_int(value[1])
+        if sec is not None and nsec is not None and sec >= 0 and 0 <= nsec < 1_000_000_000:
+            return sec * 1_000_000_000 + nsec
+    return None
+
+
+def _span_time_ns(span, unix_key, hrtime_key):
+    """Native span timestamp: UnixNano first, HrTime array fallback."""
+    ns = _parse_ns(span.get(unix_key))
+    if ns is not None:
+        return ns
+    return _hrtime_to_ns(span.get(hrtime_key))
+
+
+def _resource_attrs(resource):
+    """Flatten a resource block to a plain {key: value} dict.
+
+    Accepts the OTLP/HTTP JSON list form (resource.attributes as a
+    key/value list), the ReadableSpan flat-dict form
+    (resource.attributes as a dict), and the top-level flat form
+    ({"service.name": ...} directly on resource). (FR7-01)
+    """
+    if not isinstance(resource, dict):
+        return {}
+    attrs = resource.get("attributes")
+    if isinstance(attrs, dict):
+        return dict(attrs)
+    if isinstance(attrs, list):
+        return _attrs_to_dict(attrs)
+    return {k: v for k, v in resource.items() if k != "attributes"}
+
+
+def _normalize_event(ev):
+    if not isinstance(ev, dict):
+        return {"name": None, "timeUnixNano": None, "attributes": {}}
+    attrs = ev.get("attributes")
+    if isinstance(attrs, list):
+        attrs = _attrs_to_dict(attrs)
+    elif not isinstance(attrs, dict):
+        attrs = {}
+    t = _span_time_ns(ev, "timeUnixNano", "time")
+    return {
+        "name": ev.get("name"),
+        "timeUnixNano": str(t) if t is not None else None,
+        "attributes": dict(attrs),
+    }
+
+
+def _normalize_link(link):
+    if not isinstance(link, dict):
+        return {"traceId": None, "spanId": None, "attributes": {}}
+    ctx = link.get("context") or {}
+    attrs = link.get("attributes")
+    if isinstance(attrs, list):
+        attrs = _attrs_to_dict(attrs)
+    elif not isinstance(attrs, dict):
+        attrs = {}
+    return {
+        "traceId": link.get("traceId") or ctx.get("traceId"),
+        "spanId": link.get("spanId") or ctx.get("spanId"),
+        "attributes": dict(attrs),
+    }
+
+
+def _normalize_span(span):
+    """Normalize one raw span dict into the internal flattened shape.
+
+    Accepts both the OTLP/HTTP JSON span (startTimeUnixNano,
+    parentSpanId, attributes as a key/value list) and the
+    FileSpanExporter ReadableSpan shape (startTime/endTime as HrTime
+    [seconds, nanoseconds] arrays, spanContext/parentSpanContext,
+    attributes as a flat dict, nested resource.attributes).
+    Already-flat spans pass through unchanged. (FR7-01)
+    """
+    if not isinstance(span, dict):
+        return span
+    span_ctx = span.get("spanContext") or {}
+    parent_ctx = span.get("parentSpanContext") or {}
+    attrs = span.get("attributes")
+    if isinstance(attrs, list):
+        attrs = _attrs_to_dict(attrs)
+    elif not isinstance(attrs, dict):
+        attrs = {}
+    start_ns = _span_time_ns(span, "startTimeUnixNano", "startTime")
+    end_ns = _span_time_ns(span, "endTimeUnixNano", "endTime")
+    scope = span.get("scope") or span.get("instrumentationScope") or span.get("instrumentationLibrary") or {}
+    if not isinstance(scope, dict):
+        scope = {}
+    return {
+        "traceId": span.get("traceId") or span_ctx.get("traceId"),
+        "spanId": span.get("spanId") or span_ctx.get("spanId"),
+        "parentSpanId": span.get("parentSpanId") or parent_ctx.get("spanId") or "",
+        "name": span.get("name"),
+        "kind": span.get("kind"),
+        "startTimeUnixNano": str(start_ns) if start_ns is not None else None,
+        "endTimeUnixNano": str(end_ns) if end_ns is not None else None,
+        "attributes": dict(attrs),
+        "events": [_normalize_event(ev) for ev in (span.get("events") or [])],
+        "links": [_normalize_link(link) for link in (span.get("links") or [])],
+        "status": span.get("status") or {},
+        "resource": _resource_attrs(span.get("resource")),
+        "scope": {
+            "name": scope.get("name"),
+            "version": scope.get("version"),
+        },
+    }
+
+
+# Session-id keys, in precedence order: the GenAI conversation id,
+# then the Copilot chat-session aliases. (FR7-03)
+_SESSION_ID_KEYS = (
+    "gen_ai.conversation.id",
+    "copilot_chat.chat_session_id",
+    "copilot_chat.session_id",
+)
+
+
+def _resolve_session_id(attrs):
+    """First non-empty session id across the conversation-id keys."""
+    for key in _SESSION_ID_KEYS:
+        value = (attrs or {}).get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def flatten_payload(payload):
     """Flatten an OTLP/HTTP JSON payload into a list of span dicts.
 
@@ -309,22 +490,25 @@ def flatten_payload(payload):
     """
     spans = []
     for resource_span in payload.get("resourceSpans") or []:
-        resource_attrs = _attrs_to_dict(
-            (resource_span.get("resource") or {}).get("attributes")
-        )
+        resource_attrs = _resource_attrs(resource_span.get("resource"))
         for scope_span in resource_span.get("scopeSpans") or []:
             scope = scope_span.get("scope") or {}
             for span in scope_span.get("spans") or []:
                 status = span.get("status") or {}
+                start_ns = _span_time_ns(span, "startTimeUnixNano", "startTime")
+                end_ns = _span_time_ns(span, "endTimeUnixNano", "endTime")
+                parent_ctx = span.get("parentSpanContext") or {}
                 spans.append(
                     {
                         "traceId": span.get("traceId"),
                         "spanId": span.get("spanId"),
-                        "parentSpanId": span.get("parentSpanId"),
+                        "parentSpanId": span.get("parentSpanId")
+                        or parent_ctx.get("spanId")
+                        or "",
                         "name": span.get("name"),
                         "kind": span.get("kind"),
-                        "startTimeUnixNano": span.get("startTimeUnixNano"),
-                        "endTimeUnixNano": span.get("endTimeUnixNano"),
+                        "startTimeUnixNano": str(start_ns) if start_ns is not None else None,
+                        "endTimeUnixNano": str(end_ns) if end_ns is not None else None,
                         "attributes": _attrs_to_dict(span.get("attributes")),
                         "events": [
                             {
@@ -464,7 +648,8 @@ class CopilotObserver:
             "ingest_lines_invalid": 0,
         }
         self._seen = {}  # (traceId, spanId) -> time (bounded dedup)
-        # (traceId, spanId) -> (operation, parentSpanId, conversation_id)
+        # (traceId, spanId) -> (operation, parentSpanId, session_id)
+        # (session_id resolved via _resolve_session_id, FR7-03)
         self._native_index = {}
         # (traceId, spanId) -> Context carrying the fleet span (for
         # native parent resolution; spans may be ended already).
@@ -541,10 +726,18 @@ class CopilotObserver:
         """Read the Copilot file exporter's JSONL output.
 
         One JSON value per line. Each line is accepted as either a full
-        OTLP payload (``resourceSpans``) or a single flattened span
-        (``traceId`` + ``spanId``). Metric/log payloads are skipped and
-        counted, never treated as errors. Returns a summary dict.
-        Never raises.
+        OTLP payload (``resourceSpans``) or a single span — the
+        FileSpanExporter ReadableSpan shape (``spanContext`` /
+        ``parentSpanContext``, HrTime ``startTime``/``endTime``,
+        nested ``resource.attributes``) or a flattened span
+        (``traceId`` + ``spanId``). Metric/log lines
+        (``resourceMetrics`` / ``resourceLogs``, ``scopeMetrics`` /
+        ``scopeLogs``, ``type`` == "metric", ``dataPoints``, OTel JS
+        log records with ``hrTime`` + ``body``) are skipped and
+        counted, never treated as errors. Span lines are collected
+        across the file and handed to ``handle_spans`` in one batch so
+        parents order before children even when the file lists
+        children first. Returns a summary dict. Never raises.
         """
         summary = {
             "lines": 0,
@@ -553,6 +746,7 @@ class CopilotObserver:
             "invalid_lines": 0,
             "ingest_errors": 0,
         }
+        collected = []
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 for line in fh:
@@ -571,15 +765,32 @@ class CopilotObserver:
                         self._count("ingest_lines_invalid")
                         continue
                     if "resourceSpans" in obj:
-                        summary["spans_enqueued"] += self.handle_payload(obj)
+                        collected.extend(flatten_payload(obj))
                     elif "traceId" in obj and "spanId" in obj:
-                        summary["spans_enqueued"] += self.handle_spans([obj])
-                    elif "resourceMetrics" in obj or "resourceLogs" in obj:
+                        collected.append(obj)
+                    elif (
+                        isinstance(obj.get("spanContext"), dict)
+                        and "traceId" in obj["spanContext"]
+                        and "spanId" in obj["spanContext"]
+                    ):
+                        # ReadableSpan line: spanContext carries the ids.
+                        collected.append(obj)
+                    elif (
+                        "resourceMetrics" in obj
+                        or "resourceLogs" in obj
+                        or "scopeMetrics" in obj
+                        or "scopeLogs" in obj
+                        or obj.get("type") == "metric"
+                        or "dataPoints" in obj
+                        or ("hrTime" in obj and "body" in obj)
+                    ):
                         summary["skipped_non_trace"] += 1
                         self._count("ingest_lines_skipped")
                     else:
                         summary["invalid_lines"] += 1
                         self._count("ingest_lines_invalid")
+            if collected:
+                summary["spans_enqueued"] = self.handle_spans(collected)
         except Exception:
             summary["ingest_errors"] += 1
             self._count("ingest_errors")
@@ -588,14 +799,27 @@ class CopilotObserver:
     # -- batch indexing + ordering -----------------------------------------
     def _operation_of(self, span):
         attrs = span.get("attributes") or {}
-        op = attrs.get("gen_ai.operation.name") or span.get("name") or ""
+        op = attrs.get("gen_ai.operation.name")
+        if not op:
+            # FileSpanExporter span names carry a target suffix
+            # ("chat github.copilot", "hook PreToolUse"); the operation
+            # is the first token. (FR7-04)
+            parts = (span.get("name") or "").split()
+            op = parts[0] if parts else ""
+        if op == "hook":
+            op = "execute_hook"
         return op if op in OPERATIONS else None
 
     def _index_and_enqueue(self, spans):
         """Filter, dedup, index, topologically order, enqueue."""
         # Pass 1: validate IDs, filter scope/operation, dedup, index.
         kept = []
-        for span in spans:
+        for raw_span in spans:
+            # Normalize the FileSpanExporter ReadableSpan shape into
+            # the internal flattened shape (HrTime timestamps,
+            # parentSpanContext, nested resource attributes). Already
+            # flat spans pass through unchanged. (FR7-01)
+            span = _normalize_span(raw_span)
             if not isinstance(span, dict):
                 self._count("invalid_spans")
                 continue
@@ -617,10 +841,18 @@ class CopilotObserver:
             attrs = span.get("attributes") or {}
             resource = span.get("resource") or {}
             service = resource.get("service.name")
-            if service is not None and service not in COPILOT_SERVICES:
+            # Out-of-scope services are matched case-insensitively
+            # ("Claude-Code", "COPILOT-CHAT"). (FR7-05)
+            if service is not None and (
+                not isinstance(service, str) or service.lower() not in COPILOT_SERVICES
+            ):
                 self._count("out_of_scope")
                 continue
-            if attrs.get("gen_ai.agent.name") == "claude":
+            agent_name = attrs.get("gen_ai.agent.name")
+            if (
+                isinstance(agent_name, str)
+                and agent_name.strip().lower() in ("claude", "claude-code")
+            ):
                 # Claude agent spans (invoke_agent claude) are not
                 # Copilot spans; Claude Code has its own M2 path.
                 self._count("out_of_scope")
@@ -632,7 +864,7 @@ class CopilotObserver:
             parent_id = span.get("parentSpanId") or ""
             if parent_id and not _valid_span_id(parent_id):
                 parent_id = ""
-            conv = attrs.get("gen_ai.conversation.id") or ""
+            conv = _resolve_session_id(attrs)
             with self._lock:
                 if len(self._native_index) > MAX_NATIVE_INDEX:
                     self._native_index.pop(next(iter(self._native_index)))
@@ -777,11 +1009,11 @@ class CopilotObserver:
                 self._count("unknown_event_seen")
 
     def _session_id_for(self, trace_id, span_id, attrs):
-        """Conversation id for a span: its own, else the enclosing
+        """Session id for a span: its own, else the enclosing
         invoke_agent's (via the native index), else the trace fallback."""
-        conv = attrs.get("gen_ai.conversation.id") or ""
-        if isinstance(conv, str) and conv.strip():
-            return conv.strip()
+        own = _resolve_session_id(attrs)
+        if own:
+            return own
         # Walk up the native parent chain to the enclosing invoke_agent.
         seen = set()
         cur = span_id
@@ -791,8 +1023,8 @@ class CopilotObserver:
             if entry is None:
                 break
             op, parent, conv_up = entry
-            if conv_up and isinstance(conv_up, str) and conv_up.strip():
-                return conv_up.strip()
+            if conv_up:
+                return conv_up
             if op == "invoke_agent":
                 break
             cur = parent
@@ -800,14 +1032,21 @@ class CopilotObserver:
         return "trace:%s" % trace_id
 
     def _root_span_id_for(self, trace_id, span_id):
-        """Enclosing invoke_agent spanId for a span, or '' if unknown."""
+        """Enclosing invoke_agent spanId for a span, or '' if unknown.
+
+        In streaming export the parent invoke_agent may not have
+        finished yet, so it is not in the index; the highest known
+        ancestor parentSpanId is then returned (FR7-02) so the child
+        keys its lazy root under (trace_id, root_span_id) and the
+        root folds into it when it arrives.
+        """
         seen = set()
         cur = span_id
         while cur and cur not in seen:
             seen.add(cur)
             entry = self._native_index.get((trace_id, cur))
             if entry is None:
-                return ""
+                return cur if cur != span_id else ""
             op, parent, _ = entry
             if op == "invoke_agent":
                 return cur
@@ -835,7 +1074,11 @@ class CopilotObserver:
             "observation.completeness": "complete",
         }
         self._add_common_attrs(out, attrs)
-        turn_count = _parse_int(attrs.get("copilot_chat.turn_count"))
+        turn_count = _parse_int(
+            _attr_first(
+                attrs, "copilot_chat.turn_count", "github.copilot.turn_count"
+            )
+        )
         if turn_count is not None:
             out["copilot.turn_count"] = turn_count
         return out
@@ -919,7 +1162,7 @@ class CopilotObserver:
                 self._count("parent_unresolved")
         lazy_key = (trace_id, "")
         lazy = self._turn_roots.get(lazy_key)
-        if lazy is not None:
+        if lazy is not None and not parent_id:
             # Children arrived before their root: fold the root's
             # attributes into the lazy root and close it at the
             # invoke_agent end time. One agent.run per turn, never two.
@@ -927,6 +1170,10 @@ class CopilotObserver:
             # parent tool span was known, it keeps its own fresh trace
             # instead of nesting under that tool span; the turn
             # correlation via turn.id still holds.)
+            # FR7-02: only a top-level invoke_agent (no parent span)
+            # may fold the unkeyed lazy root — a subagent invoke_agent
+            # with a parent_span_id must never hijack the parent
+            # turn's lazy root.
             root = lazy
             del self._turn_roots[lazy_key]
             root["session_id"] = session_id
@@ -947,8 +1194,25 @@ class CopilotObserver:
             return
         existing = self._turn_roots.get((trace_id, span_id))
         if existing is not None:
-            # Defensive: an open root under this exact key (should not
-            # happen — roots close when their invoke_agent is processed).
+            # Keyed lazy root: children arrived before their
+            # invoke_agent (streaming export — the parent had not
+            # finished when the children were exported, so they keyed
+            # the lazy root under (trace_id, root_span_id) per
+            # _root_span_id_for, FR7-02). Fold the root attributes
+            # onto it and record the native context before ending it,
+            # so agent.run retains all root attributes
+            # (gen_ai.request.model, gen_ai.usage.*, copilot.agent.type,
+            # copilot.git.*, copilot.turn_count).
+            existing["session_id"] = session_id
+            existing["turn_id"] = turn_id
+            existing["lazy"] = False
+            for k, v in sanitize_attributes(self._root_attrs(span, session_id, turn_id)).items():
+                try:
+                    existing["span"].set_attribute(k, v)
+                except Exception:
+                    pass
+            self._native_contexts[(trace_id, span_id)] = existing["ctx"]
+            self._count("lazy_roots_folded")
             self._close_root(existing, span, end_ns, (trace_id, span_id))
             return
         # Normal case: the root arrives first (or with no children).
@@ -1082,7 +1346,6 @@ class CopilotObserver:
             if isinstance(tool_type, str) and tool_type != "":
                 out["copilot.tool.type"] = tool_type[:MAX_ATTRIBUTE_CHARS]
             for key, fleet_key in (
-                ("github.copilot.tool.parameters.mcp_server_name_hash", "copilot.mcp_server_name_hash"),
                 ("github.copilot.tool.parameters.mcp_tool_name", "copilot.mcp_tool_name"),
                 ("github.copilot.tool.parameters.skill_name", "copilot.skill_name"),
                 ("github.copilot.tool.parameters.edit_type", "copilot.edit_type"),
@@ -1090,6 +1353,14 @@ class CopilotObserver:
                 value = attrs.get(key)
                 if isinstance(value, str) and value != "":
                     out[fleet_key] = value[:MAX_ATTRIBUTE_CHARS]
+            # SDK alias for the MCP server name hash (FR7-04).
+            mcp_hash = _attr_first(
+                attrs,
+                "github.copilot.tool.parameters.mcp_server_name_hash",
+                "github.copilot.mcp.server.name_hash",
+            )
+            if isinstance(mcp_hash, str) and mcp_hash != "":
+                out["copilot.mcp_server_name_hash"] = mcp_hash[:MAX_ATTRIBUTE_CHARS]
         elif op == "execute_hook":
             decision = attrs.get("github.copilot.hook.decision")
             if isinstance(decision, str) and decision != "":
@@ -1097,7 +1368,9 @@ class CopilotObserver:
             duration = _parse_float(attrs.get("github.copilot.hook.duration"))
             if duration is not None:
                 out["copilot.hook.duration_s"] = duration
-            hook_type = attrs.get("copilot_chat.hook_type")
+            hook_type = _attr_first(
+                attrs, "copilot_chat.hook_type", "github.copilot.hook.type"
+            )
             if isinstance(hook_type, str) and hook_type != "":
                 out["copilot.hook.type"] = hook_type[:MAX_ATTRIBUTE_CHARS]
             result = attrs.get("copilot_chat.hook_result_kind")

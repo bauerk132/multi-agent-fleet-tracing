@@ -160,6 +160,34 @@ def _hook(span_id, trace_id=TRACE_ID, parent=None, status=0, **extra):
     return _span("execute_hook", span_id, trace_id, parent, attrs, status=status)
 
 
+def _readable_span(name, span_id, trace_id=TRACE_ID, parent_span_id=None,
+                   start=(1762450000, 0), end=(1762450001, 0),
+                   attrs=None, service="copilot-chat"):
+    """One FileSpanExporter JSONL line: a ReadableSpan object (FR7-01).
+
+    HrTime [seconds, nanoseconds] timestamps, spanContext /
+    parentSpanContext ids, flat-dict attributes, nested
+    resource.attributes. No top-level traceId/spanId/parentSpanId.
+    """
+    line = {
+        "name": name,
+        "spanContext": {"traceId": trace_id, "spanId": span_id, "traceFlags": "01"},
+        "kind": 1,
+        "startTime": [start[0], start[1]],
+        "endTime": [end[0], end[1]],
+        "attributes": dict(attrs or {}),
+        "events": [],
+        "status": {"code": 1},
+        "resource": {"attributes": {"service.name": service}},
+        "instrumentationScope": {"name": "copilot-chat", "version": "0.73.0"},
+    }
+    if parent_span_id:
+        line["parentSpanContext"] = {
+            "traceId": trace_id, "spanId": parent_span_id, "traceFlags": "01",
+        }
+    return line
+
+
 # Subprocess script: load the plugin from a staged copy of ONLY the
 # copilot_plugin directory (no observability/ on sys.path), create an
 # observer, drive handle_payload, print STAGED-OK.
@@ -607,6 +635,361 @@ class CopilotPluginTestCase(unittest.TestCase):
         self.assertFalse(settings["github.copilot.chat.otel.captureContent"])
         self.assertFalse(settings["github.copilot.chat.otel.captureIdentity"])
         self.assertEqual(settings["github.copilot.chat.otel.exporterType"], "file")
+
+    # -- FR7-01: ReadableSpan JSONL (HrTime, parentSpanContext, nested resource)
+    def test_fr7_01_readable_span_jsonl(self):
+        root = _hex16(1)
+        chat = _hex16(2)
+        root_line = _readable_span(
+            "invoke_agent", root,
+            start=(1762450000, 123000000), end=(1762450005, 0),
+            attrs={
+                "gen_ai.operation.name": "invoke_agent",
+                "gen_ai.conversation.id": "conv-1",
+                "gen_ai.request.model": "gpt-4o",
+                "gen_ai.usage.input_tokens": 1200,
+                "gen_ai.usage.output_tokens": 300,
+                "copilot_chat.turn_count": 3,
+            },
+        )
+        chat_line = _readable_span(
+            "chat", chat, parent_span_id=root,
+            start=(1762450000, 200000000), end=(1762450001, 0),
+            attrs={
+                "gen_ai.operation.name": "chat",
+                "gen_ai.request.model": "gpt-4o",
+                "gen_ai.usage.input_tokens": 400,
+                "gen_ai.usage.output_tokens": 100,
+            },
+        )
+        path = self.tmpdir / "copilot-otel.jsonl"
+        path.write_text(json.dumps(root_line) + "\n" + json.dumps(chat_line) + "\n")
+        summary = self.observer.ingest_jsonl(str(path))
+        self.assertTrue(self.observer.drain(timeout=5.0))
+        self.assertEqual(summary["spans_enqueued"], 2, summary)
+        self.assertEqual(summary["invalid_lines"], 0, summary)
+        roots = self._spans_named("agent.run")
+        llm = self._spans_named("llm.call")
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(len(llm), 1)
+        # HrTime arrays convert to Unix nanoseconds.
+        self.assertEqual(int(roots[0]["startTimeUnixNano"]), 1762450000123000000)
+        self.assertEqual(int(llm[0]["startTimeUnixNano"]), 1762450000200000000)
+        # parentSpanContext links the child to the root turn.
+        self.assertEqual(llm[0]["attributes"]["turn.id"], TRACE_ID + ":" + root)
+        self.assertEqual(roots[0]["attributes"]["gen_ai.request.model"], "gpt-4o")
+        self.assertEqual(roots[0]["attributes"]["copilot.turn_count"], 3)
+
+    def test_fr7_01_nested_resource_attributes(self):
+        # OTLP key/value-list resource attributes: claude-code is out
+        # of scope even in the nested form.
+        claude_line = _readable_span("invoke_agent", _hex16(9), TRACE_ID_2)
+        claude_line["resource"] = {"attributes": [
+            {"key": "service.name", "value": {"stringValue": "claude-code"}},
+        ]}
+        claude_line["attributes"] = {
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.conversation.id": "conv-cc",
+        }
+        # Flat-dict resource attributes: copilot-chat is in scope.
+        ok_line = _readable_span("invoke_agent", _hex16(1))
+        ok_line["attributes"] = {
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.conversation.id": "conv-1",
+        }
+        path = self.tmpdir / "copilot-otel.jsonl"
+        path.write_text(json.dumps(claude_line) + "\n" + json.dumps(ok_line) + "\n")
+        summary = self.observer.ingest_jsonl(str(path))
+        self.assertTrue(self.observer.drain(timeout=5.0))
+        self.assertEqual(summary["spans_enqueued"], 1, summary)
+        diag = self.observer.diagnostics()
+        self.assertEqual(diag["out_of_scope"], 1, diag)
+        self.assertEqual(len(self._spans_named("agent.run")), 1)
+
+    def test_fr7_01_non_trace_jsonl_lines_skipped(self):
+        lines = [
+            json.dumps({"scopeMetrics": [{"scope": {}, "metrics": []}]}),
+            json.dumps({"type": "metric", "name": "tokens"}),
+            json.dumps({"dataPoints": [{"value": 1}]}),
+            json.dumps({"hrTime": [1762450000, 0], "body": "session started"}),
+            json.dumps({"scopeLogs": [{"scope": {}, "logRecords": []}]}),
+        ]
+        path = self.tmpdir / "copilot-otel.jsonl"
+        path.write_text("\n".join(lines) + "\n")
+        summary = self.observer.ingest_jsonl(str(path))
+        self.assertTrue(self.observer.drain(timeout=5.0))
+        self.assertEqual(summary["lines"], 5, summary)
+        self.assertEqual(summary["skipped_non_trace"], 5, summary)
+        self.assertEqual(summary["invalid_lines"], 0, summary)
+        self.assertEqual(summary["spans_enqueued"], 0, summary)
+
+    # -- FR7-02: child-before-root ordering + keyed lazy roots -----------
+    def test_fr7_02_child_before_root_jsonl_orders_parents_first(self):
+        root = _hex16(1)
+        chat = _hex16(2)
+        # Child line FIRST in the file, root line second.
+        chat_line = _readable_span(
+            "chat", chat, parent_span_id=root,
+            start=(1762450000, 200000000), end=(1762450001, 0),
+            attrs={
+                "gen_ai.operation.name": "chat",
+                "gen_ai.request.model": "gpt-4o",
+            },
+        )
+        root_line = _readable_span(
+            "invoke_agent", root,
+            start=(1762450000, 0), end=(1762450005, 0),
+            attrs={
+                "gen_ai.operation.name": "invoke_agent",
+                "gen_ai.conversation.id": "conv-1",
+                "gen_ai.request.model": "gpt-4o",
+                "gen_ai.usage.input_tokens": 1200,
+                "copilot_chat.turn_count": 2,
+            },
+        )
+        path = self.tmpdir / "copilot-otel.jsonl"
+        path.write_text(json.dumps(chat_line) + "\n" + json.dumps(root_line) + "\n")
+        summary = self.observer.ingest_jsonl(str(path))
+        self.assertTrue(self.observer.drain(timeout=5.0))
+        self.assertEqual(summary["spans_enqueued"], 2, summary)
+        # Batching ordered the root first: no lazy root was needed and
+        # the child carries the root's turn id.
+        diag = self.observer.diagnostics()
+        self.assertEqual(diag["lazy_roots_folded"], 0, diag)
+        roots = self._spans_named("agent.run")
+        llm = self._spans_named("llm.call")
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(len(llm), 1)
+        self.assertEqual(llm[0]["attributes"]["turn.id"], TRACE_ID + ":" + root)
+        self.assertEqual(roots[0]["attributes"]["gen_ai.request.model"], "gpt-4o")
+        self.assertEqual(roots[0]["attributes"]["copilot.turn_count"], 2)
+
+    def test_fr7_02_streaming_child_keys_lazy_root_by_root_span_id(self):
+        root = _hex16(1)
+        chat = _hex16(2)
+        # Child arrives (own batch) while the invoke_agent has not
+        # finished yet: the parent is not in the index.
+        self._deliver(_payload([_chat(chat, parent=root)]))
+        llm = self._spans_named("llm.call")
+        self.assertEqual(len(llm), 1)
+        self.assertEqual(llm[0]["attributes"]["turn.id"], TRACE_ID + ":" + root)
+        # The root arrives later and folds into the keyed lazy root,
+        # retaining all root attributes.
+        self._deliver(_payload([_invoke_agent(root)]))
+        diag = self.observer.diagnostics()
+        self.assertEqual(diag["lazy_roots_folded"], 1, diag)
+        roots = self._spans_named("agent.run")
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(roots[0]["attributes"]["turn.id"], TRACE_ID + ":" + root)
+        self.assertEqual(roots[0]["attributes"]["session.id"], "conv-1")
+        self.assertEqual(roots[0]["attributes"]["gen_ai.request.model"], "gpt-4o")
+        self.assertEqual(roots[0]["attributes"]["gen_ai.usage.input_tokens"], 1200)
+        self.assertEqual(roots[0]["attributes"]["gen_ai.usage.output_tokens"], 300)
+        self.assertEqual(roots[0]["attributes"]["copilot.agent.type"], "builtin")
+        self.assertEqual(roots[0]["attributes"]["copilot.git.branch"], "staging")
+        self.assertEqual(roots[0]["attributes"]["copilot.turn_count"], 3)
+
+    def test_fr7_02_subagent_root_does_not_hijack_unkeyed_lazy_root(self):
+        # A child whose parent chain ends at a non-root span creates
+        # an unkeyed lazy root (trace, ""). A subagent invoke_agent
+        # arriving next must NOT fold that root; only the parent
+        # invoke_agent (no parent span) may.
+        top_chat = _hex16(11)
+        tool = _hex16(12)
+        sub_root = _hex16(13)
+        root = _hex16(1)
+        self._deliver(_payload([_chat(top_chat, parent=None)]))
+        self._deliver(_payload([
+            _tool(tool, parent=top_chat, tool="runSubagent", call_id="call-sub"),
+        ]))
+        self._deliver(_payload([
+            _invoke_agent(sub_root, parent=tool, conv="conv-sub"),
+        ]))
+        self._deliver(_payload([
+            _invoke_agent(root, conv="conv-parent", turn_count=7),
+        ]))
+        diag = self.observer.diagnostics()
+        self.assertEqual(diag["lazy_roots_folded"], 1, diag)
+        roots = self._spans_named("agent.run")
+        self.assertEqual(len(roots), 2)
+        parent_root = [r for r in roots if r["attributes"]["turn.id"] == TRACE_ID + ":" + root][0]
+        subagent_root = [r for r in roots if r["attributes"]["turn.id"] == TRACE_ID + ":" + sub_root][0]
+        self.assertEqual(parent_root["attributes"]["session.id"], "conv-parent")
+        self.assertEqual(parent_root["attributes"]["copilot.turn_count"], 7)
+        self.assertEqual(subagent_root["attributes"]["session.id"], "conv-sub")
+        tools = self._spans_named("tool.exec")
+        run_tool = [t for t in tools if t["attributes"]["gen_ai.tool.name"] == "runSubagent"][0]
+        self.assertEqual(subagent_root["parentSpanId"], run_tool["spanId"])
+
+    # -- FR7-03: session-id aliases --------------------------------------
+    def test_fr7_03_session_id_aliases(self):
+        root1 = _hex16(1)
+        invoke1 = _invoke_agent(root1)
+        del invoke1["attributes"]["gen_ai.conversation.id"]
+        invoke1["attributes"]["copilot_chat.session_id"] = "sess-abc"
+        root2 = _hex16(2)
+        invoke2 = _invoke_agent(root2, trace_id=TRACE_ID_2)
+        del invoke2["attributes"]["gen_ai.conversation.id"]
+        invoke2["attributes"]["copilot_chat.chat_session_id"] = "sess-def"
+        root3 = _hex16(3)
+        invoke3 = _invoke_agent(root3, trace_id="c" * 32)
+        invoke3["attributes"]["copilot_chat.session_id"] = "sess-ignored"
+        self._deliver(_payload([invoke1]))
+        self._deliver(_payload([invoke2]))
+        self._deliver(_payload([invoke3]))
+        roots = self._spans_named("agent.run")
+        self.assertEqual(len(roots), 3)
+        by_turn = {r["attributes"]["turn.id"]: r for r in roots}
+        self.assertEqual(by_turn[TRACE_ID + ":" + root1]["attributes"]["session.id"], "sess-abc")
+        self.assertEqual(by_turn[TRACE_ID_2 + ":" + root2]["attributes"]["session.id"], "sess-def")
+        # gen_ai.conversation.id still wins over the aliases.
+        self.assertEqual(by_turn["c" * 32 + ":" + root3]["attributes"]["session.id"], "conv-1")
+
+    # -- FR7-04: span-name suffixes + SDK aliases ------------------------
+    def test_fr7_04_span_name_suffixes(self):
+        root = _hex16(1)
+        chat = _hex16(2)
+        hook = _hex16(3)
+        # No gen_ai.operation.name anywhere: the operation comes from
+        # the first token of the span name; "hook" maps to execute_hook.
+        root_span = _span("invoke_agent github.copilot", root, TRACE_ID, None,
+                          {"gen_ai.conversation.id": "conv-1"})
+        chat_span = _span("chat github.copilot", chat, TRACE_ID, root,
+                          {"gen_ai.request.model": "gpt-4o"})
+        hook_span = _span("hook PreToolUse", hook, TRACE_ID, root,
+                          {"github.copilot.hook.decision": "pass"})
+        self._deliver(_payload([root_span, chat_span, hook_span]))
+        self.assertEqual(len(self._spans_named("agent.run")), 1)
+        self.assertEqual(len(self._spans_named("llm.call")), 1)
+        self.assertEqual(len(self._spans_named("hook.exec")), 1)
+
+    def test_fr7_04_sdk_attribute_aliases(self):
+        root = _hex16(1)
+        tool = _hex16(2)
+        hook = _hex16(3)
+        invoke = _invoke_agent(root)
+        del invoke["attributes"]["copilot_chat.turn_count"]
+        invoke["attributes"]["github.copilot.turn_count"] = 5
+        tool_span = _tool(tool, parent=root, tool="readFile")
+        tool_span["attributes"]["github.copilot.mcp.server.name_hash"] = "abc123hash"
+        hook_span = _hook(hook, parent=root)
+        del hook_span["attributes"]["copilot_chat.hook_type"]
+        hook_span["attributes"]["github.copilot.hook.type"] = "PostToolUse"
+        self._deliver(_payload([invoke, tool_span, hook_span]))
+        roots = self._spans_named("agent.run")
+        tools = self._spans_named("tool.exec")
+        hooks = self._spans_named("hook.exec")
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(roots[0]["attributes"]["copilot.turn_count"], 5)
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["attributes"]["copilot.mcp_server_name_hash"], "abc123hash")
+        self.assertEqual(len(hooks), 1)
+        self.assertEqual(hooks[0]["attributes"]["copilot.hook.type"], "PostToolUse")
+
+    # -- FR7-05: new stripped keys + case-insensitive scope --------------
+    def test_fr7_05_new_stripped_keys_counted(self):
+        root = _hex16(1)
+        invoke = _invoke_agent(root, **{
+            "gen_ai.system_instructions": "SYSTEM PROMPT TEXT",
+            "gen_ai.agent.description": "AGENT DESCRIPTION TEXT",
+            "github.copilot.cwd": "/home/kbaue/secret-work",
+            "github.copilot.git_root": "/home/kbaue/secret-work",
+            "github.copilot.repository": "secret-repo",
+            "enduser.pseudo.id": "pseudo-123",
+        })
+        chat = _chat(_hex16(2), parent=root, **{
+            "copilot_chat.user_request": "USER REQUEST TEXT",
+            "copilot_chat.reasoning_content": "REASONING TEXT",
+            "copilot_chat.prompt_context": "PROMPT CONTEXT TEXT",
+            "copilot_chat.prompt_instructions": "PROMPT INSTRUCTIONS TEXT",
+            "copilot_chat.markdown_content": "MARKDOWN TEXT",
+            "copilot_chat.event_details": "EVENT DETAILS TEXT",
+            "gen_ai.tool.description": "TOOL DESCRIPTION TEXT",
+        })
+        tool = _tool(_hex16(3), parent=root, tool="runCommand", **{
+            "copilot_chat.hook_command": "HOOK COMMAND TEXT",
+            "copilot_chat.file.relative_path": "secret/file.txt",
+            "github.copilot.skill.path": "/skills/secret-skill",
+            "github.copilot.skill.content": "SKILL CONTENT TEXT",
+            "github.copilot.elicitation.message": "ELICITATION TEXT",
+            "github.copilot.hook.error_message": "HOOK ERROR TEXT",
+            "github.copilot.mcp.server.name": "secret-mcp-server",
+        })
+        self._deliver(_payload([invoke, chat, tool]))
+        diag = self.observer.diagnostics()
+        # 6 root + 8 chat (7 new + server.address, dropped) + 7 tool.
+        self.assertEqual(diag["stripped_fields"], 21, diag)
+        blob = json.dumps(self.recv.spans)
+        for banned in (
+            "SYSTEM PROMPT TEXT", "AGENT DESCRIPTION TEXT", "secret-work",
+            "secret-repo", "pseudo-123", "USER REQUEST TEXT",
+            "REASONING TEXT", "PROMPT CONTEXT TEXT",
+            "PROMPT INSTRUCTIONS TEXT", "MARKDOWN TEXT",
+            "EVENT DETAILS TEXT", "TOOL DESCRIPTION TEXT",
+            "HOOK COMMAND TEXT", "secret/file.txt", "secret-skill",
+            "SKILL CONTENT TEXT", "ELICITATION TEXT", "HOOK ERROR TEXT",
+            "secret-mcp-server",
+        ):
+            self.assertNotIn(banned, blob, banned)
+
+    def test_fr7_05_out_of_scope_case_insensitive(self):
+        agent_cases = []
+        for i, name in enumerate(("Claude", "CLAUDE", "claude-code")):
+            agent_cases.append(_span(
+                "invoke_agent", _hex16(10 + i), "%032x" % (0xE0 + i), None,
+                {
+                    "gen_ai.operation.name": "invoke_agent",
+                    "gen_ai.agent.name": name,
+                    "gen_ai.conversation.id": "conv-claude",
+                },
+            ))
+        self._deliver(_payload(agent_cases))
+        for j, service in enumerate(("Claude-Code", "CLAUDE-CODE")):
+            span = _span(
+                "invoke_agent", _hex16(20 + j), "%032x" % (0xF0 + j), None,
+                {
+                    "gen_ai.operation.name": "invoke_agent",
+                    "gen_ai.conversation.id": "conv-cc",
+                },
+            )
+            self._deliver(_payload([span], service=service))
+        # Mixed-case Copilot service is still in scope.
+        ok = _invoke_agent(_hex16(1))
+        self._deliver(_payload([ok], service="Copilot-Chat"))
+        diag = self.observer.diagnostics()
+        self.assertEqual(diag["out_of_scope"], 5, diag)
+        self.assertEqual(diag["accepted"], 1, diag)
+        self.assertEqual(len(self._spans_named("agent.run")), 1)
+
+    # -- FR7-06: docs + example portability -------------------------------
+    def test_fr7_06_config_doc_notes_json_default_and_readable_span(self):
+        text = (PLUGIN_DIR / "config.md").read_text()
+        for required in (
+            "http/json",
+            "0.73.0",
+            "ReadableSpan",
+            "HrTime",
+            "parentSpanContext",
+            "spanContext",
+        ):
+            self.assertIn(required, text, required)
+
+    def test_fr7_06_example_falls_back_without_collector(self):
+        script = HERE / "examples" / "map_copilot_sample_to_agentscope_feed.py"
+        env = dict(os.environ)
+        env["AGENTSCOPE_SRC"] = str(self.tmpdir / "no-such-collector")
+        env.pop("PYTHONPATH", None)
+        proc = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(self.tmpdir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("AGENTSCOPE_SRC", proc.stderr)
+        self.assertNotIn("Traceback", proc.stdout + proc.stderr)
 
     # -- staged standalone load (subprocess) -----------------------------------
     def test_package_loads_standalone_from_staged_copy(self):
