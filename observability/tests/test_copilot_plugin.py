@@ -991,6 +991,119 @@ class CopilotPluginTestCase(unittest.TestCase):
         self.assertIn("AGENTSCOPE_SRC", proc.stderr)
         self.assertNotIn("Traceback", proc.stdout + proc.stderr)
 
+    # -- FR8-01: log spanContext poisoning ---------------------------------
+    def test_fr8_01_log_records_with_span_context_do_not_poison_seen(self):
+        # FileLogExporter writes log records WHILE invoke_agent / chat /
+        # execute_tool spans are active: the lines carry hrTime,
+        # hrTimeObserved, body AND spanContext with the active span's
+        # ids, and land in the file BEFORE the real span ends. They
+        # must be skipped as non-trace; if collected, they fail
+        # _operation_of and poison _seen so 100% of the real spans
+        # are dropped as duplicates.
+        root = _hex16(1)
+        chat = _hex16(2)
+        log_root = {
+            "hrTime": [1762450000, 50000000],
+            "hrTimeObserved": [1762450000, 60000000],
+            "body": "copilot_chat.session.start",
+            "spanContext": {"traceId": TRACE_ID, "spanId": root},
+            "severityText": "INFO",
+            "attributes": {"copilot_chat.session_id": "sess-1"},
+        }
+        log_chat = {
+            "hrTime": [1762450000, 200000000],
+            "hrTimeObserved": [1762450000, 210000000],
+            "body": "copilot_chat.agent.turn",
+            "spanContext": {"traceId": TRACE_ID, "spanId": chat},
+            "severityNumber": 9,
+            "attributes": {"copilot_chat.turn_count": 1},
+        }
+        root_line = _readable_span(
+            "invoke_agent", root,
+            start=(1762450000, 0), end=(1762450005, 0),
+            attrs={
+                "gen_ai.operation.name": "invoke_agent",
+                "gen_ai.conversation.id": "conv-1",
+                "gen_ai.request.model": "gpt-4o",
+                "gen_ai.usage.input_tokens": 1200,
+                "copilot_chat.turn_count": 2,
+            },
+        )
+        chat_line = _readable_span(
+            "chat", chat, parent_span_id=root,
+            start=(1762450000, 200000000), end=(1762450001, 0),
+            attrs={
+                "gen_ai.operation.name": "chat",
+                "gen_ai.request.model": "gpt-4o",
+            },
+        )
+        path = self.tmpdir / "copilot-otel.jsonl"
+        path.write_text("\n".join(
+            json.dumps(line) for line in (log_root, log_chat, root_line, chat_line)
+        ) + "\n")
+        summary = self.observer.ingest_jsonl(str(path))
+        self.assertTrue(self.observer.drain(timeout=5.0))
+        self.assertEqual(summary["lines"], 4, summary)
+        self.assertEqual(summary["skipped_non_trace"], 2, summary)
+        self.assertEqual(summary["invalid_lines"], 0, summary)
+        self.assertEqual(summary["spans_enqueued"], 2, summary)
+        diag = self.observer.diagnostics()
+        self.assertEqual(diag["unknown_operation"], 0, diag)
+        self.assertEqual(diag["duplicates"], 0, diag)
+        roots = self._spans_named("agent.run")
+        llm = self._spans_named("llm.call")
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(len(llm), 1)
+        self.assertEqual(llm[0]["attributes"]["turn.id"], TRACE_ID + ":" + root)
+
+    def test_fr8_01_unknown_operation_does_not_poison_seen(self):
+        # Part (b): _seen must only record spans that survive the
+        # scope/operation filters. An unknown-operation object sharing
+        # ids with a later real span must not get the real span
+        # dropped as a duplicate.
+        root = _hex16(1)
+        mystery = _span("mystery", root, TRACE_ID, None,
+                        {"gen_ai.conversation.id": "conv-1"})
+        self._deliver(_payload([mystery]))
+        self._deliver(_payload([_invoke_agent(root)]))
+        diag = self.observer.diagnostics()
+        self.assertEqual(diag["unknown_operation"], 1, diag)
+        self.assertEqual(diag["duplicates"], 0, diag)
+        self.assertEqual(len(self._spans_named("agent.run")), 1)
+
+    # -- FR8-02: keyed lazy root registers its native context ------------
+    def test_fr8_02_keyed_lazy_root_registers_native_context(self):
+        root = _hex16(1)
+        chat = _hex16(2)
+        tool = _hex16(3)
+        # Child 1 arrives in its own streaming batch while the
+        # invoke_agent has not finished: keys the lazy root under
+        # (trace, root).
+        self._deliver(_payload([_chat(chat, parent=root)]))
+        # Child 2 arrives in a LATER batch, still before the root.
+        # Its parent (the root span id) must resolve through the
+        # lazy root's registered native context, not count
+        # parent_unresolved.
+        self._deliver(_payload([
+            _tool(tool, parent=root, tool="readFile"),
+        ]))
+        # The root arrives last and folds the keyed lazy root.
+        self._deliver(_payload([_invoke_agent(root)]))
+        diag = self.observer.diagnostics()
+        self.assertEqual(diag["parent_unresolved"], 0, diag)
+        self.assertEqual(diag["lazy_roots_folded"], 1, diag)
+        roots = self._spans_named("agent.run")
+        llm = self._spans_named("llm.call")
+        tools = self._spans_named("tool.exec")
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(len(llm), 1)
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(llm[0]["attributes"]["turn.id"], TRACE_ID + ":" + root)
+        self.assertEqual(tools[0]["attributes"]["turn.id"], TRACE_ID + ":" + root)
+        # Both children parent to the agent.run span.
+        self.assertEqual(llm[0]["parentSpanId"], roots[0]["spanId"])
+        self.assertEqual(tools[0]["parentSpanId"], roots[0]["spanId"])
+
     # -- staged standalone load (subprocess) -----------------------------------
     def test_package_loads_standalone_from_staged_copy(self):
         staged = self.tmpdir / "staged"
