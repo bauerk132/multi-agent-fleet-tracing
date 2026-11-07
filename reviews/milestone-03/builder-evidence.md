@@ -95,3 +95,74 @@ Hermes profile:
    does not block on export in the disposable profile.
 4. Hand back M3 PASS / FAIL (or FIX ROUND REQUIRED) with evidence.
    Do not enable in the active profile and do not merge to main.
+
+---
+
+## Fix Round 5 (2026-11-07) — Antigravity: M1/M2 ACCEPTED, M3 FAILS installed-build contract test
+
+Full per-finding record: `reviews/milestone-03/fix-rounds.md` (FR5-01…
+FR5-05, all P1 / blocking acceptance). Summary of what changed:
+
+- **FR5-01 — self-contained plugin.** The observer implementation
+  moved into `observability/hermes_plugin/observer.py` with relative
+  imports only; its dependencies are vendored inside the package
+  (`hermes_plugin/_otlp_json.py`, verbatim copy of
+  `observability/otlp_json.py`; `hermes_plugin/_sanitize.py`, verbatim
+  copy of the sanitize logic from `observability/fleet_trace.py`).
+  `hermes plugins doctor` can now load the plugin from a staged copy
+  of ONLY the `hermes_plugin` directory. Top-level
+  `observability/hermes_observer.py` is a thin re-export shim, so the
+  existing M3 tests and the AgentScope example work unchanged.
+- **FR5-02 — declared deps + OTel guard.** `plugin.yaml` declares
+  `python_dependencies` (OTel 1.45.1 pins, same as
+  `observability/requirements.txt`). Importing `hermes_plugin` touches
+  only the stdlib; `register()` raises a clear `RuntimeError` naming
+  the missing dependency if OpenTelemetry is absent, instead of
+  leaking an `ImportError` traceback into the host.
+- **FR5-03 — `**kwargs` callbacks.** Hook callbacks are literally
+  `def _callback(**kwargs)`, satisfying the host's
+  `_accepts_var_kwargs` check.
+- **FR5-04 — kwargs → schema-v1 mapping.** New `_event_from_kwargs`
+  (status → outcome, error dict → bounded `error_type`, subagent
+  coordinates → session/turn/request/parent-request ids, `payload`
+  kwarg as fallback; dict/object payload path kept). The observer
+  relaxes `turn_id` for human-input events only (stable default
+  `"human-input"`; `request_id` falls back to the `event_id`);
+  validation is unchanged for all other events. `_close_span` now
+  records `error.type` on failure closes, so the mapped error type
+  is observable.
+- **FR5-05 — manifest + tests.** `plugin.yaml` declares
+  `provides_hooks` (all 12 hook names). New suite
+  `observability/tests/test_hermes_plugin.py` (8 tests) covers the
+  plugin adapter, manifest parity, and both subprocess isolation
+  checks (staged copy, missing OTel).
+
+### Test results (2026-11-07)
+
+Command: `../.venv/bin/python -m unittest discover -s tests -t . -v`
+(from `observability/`, venv Python 3.12, OTel 1.45.1)
+
+**53 run, 52 passed, 1 skipped, 0 failed, ~33s.**
+
+M3 suite grew 14 → 22 tests (8 new plugin tests, all passing; the 14
+pre-existing M3 tests pass unchanged through the re-export shim). M1
+(20) and M2 (11) suites unchanged and passing. The 1 skip is the
+pre-existing live-Claude test (no real `claude` binary on this
+machine). `python3 scripts/run_offline_tests.py` → PASS (same result).
+
+### What is still NOT claimed (FR5)
+
+- **Installed Hermes contract: still UNVERIFIED on this VM.** No
+  Hermes build is installed here. Three details could not be resolved
+  from the code or the findings as handed over (see fix-rounds.md):
+  the exact Hermes runtime kwarg names / status vocabulary, the exact
+  manifest-schema shape for `python_dependencies` / `provides_hooks`,
+  and whether the host delivers flat kwargs, a `payload` kwarg, or
+  something else. The laptop-side contract test (`hermes plugins
+  doctor` on the staged `hermes_plugin/` directory + live hook
+  delivery in a disposable profile) is the verification for all three.
+- **Windows behavior is verified by reasoning + Antigravity's Windows
+  run, not by executing on Windows on this VM.**
+- M3 acceptance is NOT DECLARED — Fix Round 5 is a builder claim
+  (Implemented + Tested), not acceptance. The plugin must NOT be
+  enabled in the active Hermes profile until the contract test passes.
