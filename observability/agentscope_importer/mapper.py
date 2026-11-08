@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from .contract import (
     DEFAULT_KIND,
     FLEET_SCHEMA_VERSION,
+    GRAPH_DERIVATION,
     KIND_MAP,
     SCHEMA_VERSION,
     SOURCE,
@@ -279,24 +280,13 @@ def map_trace(trace_id, spans, producer):
             )
         )
 
-    # Graph transcribed from recorded parent links (see CONTRACT.md §3).
-    nodes = [
-        {
-            "name": s["native_id"],
-            "kind": s["kind"],
-            "attributes": {"fleet.span": s["attributes"].get("fleet.span")},
-        }
-        for s in canonical_spans
-    ]
-    edges = [
-        {"from": s["parent_native_id"], "to": s["native_id"], "kind": "static"}
-        for s in canonical_spans
-        if s["parent_native_id"]
-    ]
-    roots = [s for s in canonical_spans if not s["parent_native_id"]]
-    graph = {"nodes": nodes, "edges": edges}
-    if roots:
-        graph["entry"] = roots[0]["native_id"]
+    # D-F1 tree correction (ADR-005): no `graph` section is emitted.
+    # The fleet graph would be a span hierarchy (one node per span,
+    # edges = recorded parent links), not a framework topology, so
+    # labelling it `native` would overstate what is known. Parentage
+    # stays recorded on spans (parent_native_id); AgentScope renders
+    # the run as a tree (compute_graph -> tree) and reports quality
+    # `partial` on its own ladder. See CONTRACT.md §3 and §5.
 
     statuses = [s["status"] for s in canonical_spans]
     if "error" in statuses:
@@ -321,10 +311,9 @@ def map_trace(trace_id, spans, producer):
                 "fleet_schema_version": FLEET_SCHEMA_VERSION,
                 "producer": producer,
                 "trace_id": trace_id,
-                "graph": "transcribed-from-parentage",
+                "graph": GRAPH_DERIVATION,
             },
         },
-        "graph": graph,
         "spans": canonical_spans,
     }
     if events:

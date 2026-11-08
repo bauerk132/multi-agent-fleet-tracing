@@ -1,8 +1,8 @@
 """Milestone 5 tests (unittest) — agentscope_importer contract.
 
-Covers the M5 contract (CONTRACT.md): mapping (kinds, tokens, graph,
-seq order, native-ID preservation, dangling parents, duplicate native
-ids, parent cycles, unknown values, stripped content), the import
+Covers the M5 contract (CONTRACT.md): mapping (kinds, tokens, tree
+derivation, seq order, native-ID preservation, dangling parents,
+duplicate native ids, parent cycles, unknown values, stripped content), the import
 operation (receipt shape, duplicate delivery, late spans, out-of-order
 arrival, partial coverage, OTLP content types, restart recovery,
 retention purge, no raw-payload storage, span conflicts, event dedup),
@@ -83,7 +83,7 @@ class LedgerCase(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestMapper(unittest.TestCase):
-    def test_happy_path_kinds_tokens_graph(self):
+    def test_happy_path_kinds_tokens_tree(self):
         spans = synthetic_turn("t1")
         mapped = map_spans(spans, "copilot")
         self.assertEqual(len(mapped["documents"]), 1)
@@ -103,9 +103,13 @@ class TestMapper(unittest.TestCase):
         tool = [s for s in doc["spans"] if s["kind"] == "tool"][0]
         self.assertEqual(tool["tool"]["name"], "read_file")
         self.assertEqual(tool["tool"]["call_id"], "call-1")
-        self.assertEqual(doc["graph"]["entry"], "t1-root")
-        self.assertEqual(len(doc["graph"]["nodes"]), 3)
-        self.assertEqual(len(doc["graph"]["edges"]), 2)
+        # D-F1 tree correction (ADR-005): the mapper emits no `graph`
+        # section — the fleet graph is a span hierarchy, not a framework
+        # topology. Parentage stays recorded on spans; the derivation is
+        # labelled in run metadata and the capabilities flag is False.
+        self.assertNotIn("graph", doc)
+        self.assertEqual(doc["run"]["metadata"]["graph"], "tree-from-recorded-parentage")
+        self.assertFalse(doc["source"]["capabilities"]["supports_graph_topology"])
         self.assertEqual(doc["source"]["adapter"], "canonical")
         self.assertTrue(doc["source"]["capabilities"]["supports_token_usage"])
         self.assertEqual(mapped["tokens_in"], 120)
@@ -216,6 +220,11 @@ class TestImporter(LedgerCase):
     def test_receipt_shape(self):
         receipt = import_spans(self.conn, synthetic_turn("r1"), "copilot")
         self.assertTrue(receipt["import_id"].startswith("imp_"))
+        # D-F1 (ADR-005): fleet receipt quality is the fleet's own import
+        # accounting (complete = all spans imported, no drops, no
+        # unreadable records) — the tree derivation does not change it.
+        # The AgentScope ImportReport quality is a separate ladder and is
+        # `partial` under the tree path (CONTRACT.md §5).
         self.assertEqual(receipt["quality"], "complete")
         self.assertEqual(set(receipt["stats"]), set(STATS_KEYS))
         self.assertEqual(receipt["stats"]["runs"], 1)
@@ -305,6 +314,8 @@ class TestImporter(LedgerCase):
     def test_out_of_order_new_trace(self):
         spans = list(reversed(synthetic_turn("r5")))
         receipt = import_spans(self.conn, spans, "copilot")
+        # D-F1 (ADR-005): fleet receipt quality is the accounting ladder
+        # (see test_receipt_shape); the tree derivation does not change it.
         self.assertEqual(receipt["quality"], "complete")
         self.assertEqual(len(ledger_mod.existing_spans(self.conn, "r5")), 3)
 
@@ -375,6 +386,8 @@ class TestImporter(LedgerCase):
             }]
         }
         receipt = import_otlp_payload(self.conn, payload, "copilot")
+        # D-F1 (ADR-005): fleet receipt quality is the accounting ladder
+        # (see test_receipt_shape); the tree derivation does not change it.
         self.assertIn(receipt["quality"], ("complete", "warnings"))
         self.assertEqual(receipt["stats"]["runs"], 1)
         with self.assertRaises(ImportRefused):
@@ -551,6 +564,147 @@ class TestVerify(unittest.TestCase):
         document = map_spans(synthetic_turn("real-1"), "copilot")["documents"][0][1]
         status, detail = real_import_check(document, src)
         self.assertEqual(status, "pass", detail)
+
+
+class TestTreeDerivation(unittest.TestCase):
+    """D-F1 tree correction (ADR-005): the mapper emits no `graph`
+    section; the derivation is labelled in run metadata and receipt
+    provenance; the real importer reports quality `partial` (its own
+    ladder), while the fleet receipt keeps its accounting meaning."""
+
+    def test_no_graph_section_and_flag_false(self):
+        doc = map_spans(synthetic_turn("tree-1"), "copilot")["documents"][0][1]
+        self.assertNotIn("graph", doc)
+        self.assertFalse(doc["source"]["capabilities"]["supports_graph_topology"])
+
+    def test_run_metadata_carries_tree_label(self):
+        doc = map_spans(synthetic_turn("tree-2"), "copilot")["documents"][0][1]
+        self.assertEqual(doc["run"]["metadata"]["graph"], "tree-from-recorded-parentage")
+
+    def test_receipt_carries_derivation_and_stays_complete(self):
+        # §2.3 decision: the fleet receipt is the accounting ladder —
+        # complete = all spans imported, no drops, no unreadable
+        # records. The tree derivation is recorded in provenance, not
+        # by downgrading the receipt.
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = os.path.join(tmp, "tree.sqlite3")
+            conn = ledger_mod.open_ledger(ledger_path)
+            try:
+                receipt = import_spans(conn, synthetic_turn("tree-3"), "copilot")
+            finally:
+                conn.close()
+        self.assertEqual(receipt["quality"], "complete")
+        self.assertEqual(receipt["provenance"]["graph_derivation"],
+                         "tree-from-recorded-parentage")
+
+    def test_real_importer_reports_partial(self):
+        src = os.environ.get("AGENTSCOPE_SRC", "")
+        if not src:
+            self.skipTest("AGENTSCOPE_SRC is not set")
+        document = map_spans(synthetic_turn("tree-4"), "copilot")["documents"][0][1]
+        status, detail = real_import_check(document, src)
+        self.assertEqual(status, "pass", detail)
+        self.assertIn("partial", detail)
+        # Directly observe the stored mode, not just the quality
+        # consequence: the run must be stored as mode `tree`.
+        import sys
+        from pathlib import Path
+        backend_src = os.path.join(src, "backend", "src")
+        if backend_src not in sys.path:
+            sys.path.insert(0, backend_src)
+        from agentscope.ingest.pipeline import make_importer
+        from agentscope.store.db import DB_FILENAME, connect
+        from agentscope.store.migrate import apply_migrations
+        from agentscope_importer.mapper import canonical_bytes
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            conn = connect(tmp_path / DB_FILENAME)
+            try:
+                apply_migrations(conn)
+            finally:
+                conn.close()
+            importer = make_importer(tmp_path)
+            report = importer(canonical_bytes(document), "fleet-trace.json")
+            self.assertEqual(getattr(report.quality, "value", str(report.quality)), "partial")
+            conn = connect(tmp_path / DB_FILENAME)
+            try:
+                row = conn.execute(
+                    "SELECT graph_mode, graph_mode_reason FROM runs WHERE native_id = ?",
+                    (document["run"]["native_id"],)).fetchone()
+            finally:
+                conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "tree")
+
+    def test_document_with_graph_section_still_imports(self):
+        # The allowlist keeps "graph": canonical 0.1 documents from
+        # other producers may carry a graph section; the fleet mapper
+        # just no longer emits one. No unknown_key note for it.
+        doc = map_spans(synthetic_turn("tree-5"), "copilot")["documents"][0][1]
+        doc["graph"] = {"nodes": [], "edges": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_path = os.path.join(tmp, "tree5.sqlite3")
+            conn = ledger_mod.open_ledger(ledger_path)
+            try:
+                receipt = import_canonical_document(conn, doc, "copilot")
+            finally:
+                conn.close()
+        self.assertEqual(receipt["quality"], "complete")
+        self.assertNotIn("unknown_key", {w["code"] for w in receipt["warnings"]})
+
+
+class TestAdversarialEquivalents(LedgerCase):
+    """Equivalents of the M5 G2 adversarial probes with no dedicated
+    local coverage (D-F1 fix round, T4). The original G2 probe scripts
+    are laptop-only and not in this repo; these lock in the same
+    behaviour here. The other five probe topics (canary scrubbing,
+    cyclic graphs, bounds/DoS, retention cascades, real-import
+    variations) are covered by existing tests."""
+
+    def test_sql_injection_ids_do_not_break_ledger(self):
+        evil = "x' OR '1'='1'; DROP TABLE runs; --"
+        receipt = import_spans(self.conn, [span(evil, evil + "-root")], "copilot")
+        self.assertEqual(receipt["stats"]["runs"], 1)
+        tables = {r[0] for r in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn("runs", tables)
+        self.assertIn("spans", tables)
+        self.assertEqual(len(ledger_mod.existing_spans(self.conn, evil)), 1)
+
+    def test_timestamp_precision_edges_do_not_crash(self):
+        cases = [
+            span("ts-huge", "ts-huge-1", start=2**62, end=2**62 + 5_000_000_000),
+            span("ts-zero", "ts-zero-1", start=0, end=1_000_000_000),
+            span("ts-inverted", "ts-inverted-1",
+                 start=BASE + 5_000_000_000, end=BASE),
+            span("ts-equal", "ts-equal-1", start=BASE, end=BASE),
+        ]
+        for sp in cases:
+            receipt = import_spans(self.conn, [sp], "copilot")
+            self.assertEqual(receipt["stats"]["runs"], 1)
+
+    def test_concurrent_imports_all_land(self):
+        import threading
+        errors = []
+
+        def worker(i):
+            try:
+                conn = ledger_mod.open_ledger(self.ledger_path)
+                try:
+                    import_spans(conn, [span("conc-%d" % i, "conc-%d-root" % i)],
+                                 "copilot")
+                finally:
+                    conn.close()
+            except Exception as exc:  # noqa: BLE001
+                errors.append((i, type(exc).__name__, str(exc)))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(ledger_mod.counts(self.conn)["runs"], 8)
 
 
 if __name__ == "__main__":

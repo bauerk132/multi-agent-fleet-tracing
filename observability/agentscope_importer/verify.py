@@ -97,6 +97,11 @@ def run_verify(conn, ledger_path, producer="fleet-tracing-verify"):
     trace = "verify-trace-0001"
 
     # 1. Happy path: complete, real token totals, receipt.
+    # D-F1 (ADR-005): the fleet receipt quality is the fleet's own
+    # import accounting — complete = all spans imported, no drops, no
+    # unreadable records. The tree derivation does not change it; the
+    # AgentScope ImportReport quality is a separate ladder and is
+    # `partial` under the tree path (CONTRACT.md §5).
     spans = synthetic_turn(trace)
     receipt = import_spans(conn, spans, producer)
     results.append(
@@ -180,6 +185,9 @@ def run_verify(conn, ledger_path, producer="fleet-tracing-verify"):
     results.append(
         _check(
             "out_of_order_arrival",
+            # D-F1 (ADR-005): fleet receipt quality is the accounting
+            # ladder (see the happy-path note above); the tree
+            # derivation does not change it.
             receipt3["quality"] == "complete" and len(stored) == 3 and seq_ok,
             "quality=%s stored_spans=%d seq_by_start_time=%s" % (receipt3["quality"], len(stored), seq_ok),
         )
@@ -513,8 +521,14 @@ def real_import_check(document, agentscope_src):
         except Exception as exc:  # noqa: BLE001 - surface as fail detail
             return "fail", "real importer raised %s: %s" % (type(exc).__name__, exc)
         quality = getattr(report.quality, "value", str(report.quality))
-        if quality not in ("complete", "warnings"):
-            return "fail", "real importer quality=%r (expected complete or warnings)" % quality
+        # D-F1 tree correction (ADR-005): under the tree derivation the
+        # real importer reports quality `partial` (normalize.py:658 —
+        # partial when graph.mode != native). That is the AgentScope
+        # ImportReport ladder; the fleet receipt quality is a separate
+        # accounting ladder (CONTRACT.md §5) and stays `complete` for a
+        # clean import.
+        if quality != "partial":
+            return "fail", "real importer quality=%r (expected partial)" % quality
         if not report.run_ids:
             return "fail", "real importer returned no run_ids"
         try:
