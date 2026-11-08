@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 
 from . import ledger as ledger_mod
 from .contract import (
+    GRAPH_DERIVATION,
     JSON_CONTENT_TYPE,
     MAX_AGE_DAYS,
     MAX_BYTES_PER_IMPORT,
@@ -163,13 +164,27 @@ def _empty_stats():
 
 
 def _receipt(import_id, quality, warnings, stats, run_ids, tokens_in, tokens_out,
-             producer, content_sha256, received_at, already_imported=False):
+             producer, content_sha256, received_at, already_imported=False,
+             graph_derivation=None):
     clean_warnings = []
     for warning in warnings:
         entry = {"code": warning["code"], "message": warning["message"]}
         if warning.get("trace_id"):
             entry["source_ref"] = "trace:%s" % warning["trace_id"]
         clean_warnings.append(entry)
+    # D-F1 tree correction (ADR-005): the graph derivation is recorded in
+    # provenance when a document was actually mapped (it is not a warning
+    # and does not change receipt quality — see CONTRACT.md §5). Receipts
+    # for unsupported/invalid outcomes carry no derivation claim.
+    provenance = {
+        "producer": producer,
+        "feed": "fleet-tracing",
+        "schema_version": SCHEMA_VERSION,
+        "content_sha256": content_sha256,
+        "received_at": received_at,
+    }
+    if graph_derivation is not None:
+        provenance["graph_derivation"] = graph_derivation
     return {
         "import_id": import_id,
         "quality": quality,
@@ -179,17 +194,12 @@ def _receipt(import_id, quality, warnings, stats, run_ids, tokens_in, tokens_out
         "already_imported": already_imported,
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
-        "provenance": {
-            "producer": producer,
-            "feed": "fleet-tracing",
-            "schema_version": SCHEMA_VERSION,
-            "content_sha256": content_sha256,
-            "received_at": received_at,
-        },
+        "provenance": provenance,
     }
 
 
-def _record_receipt(conn, import_row, span_rows, event_rows, run_ids, settings):
+def _record_receipt(conn, import_row, span_rows, event_rows, run_ids, settings,
+                    graph_derivation=None):
     ledger_mod.record_import(conn, import_row, span_rows, event_rows, run_ids)
     ledger_mod.purge(conn, settings.max_imports, settings.max_age_days, import_row["received_at"])
     return _receipt(
@@ -203,6 +213,7 @@ def _record_receipt(conn, import_row, span_rows, event_rows, run_ids, settings):
         import_row["producer"],
         import_row["content_sha256"],
         import_row["received_at"],
+        graph_derivation=graph_derivation,
     )
 
 
@@ -255,12 +266,16 @@ def _outcome_sha(documents, unreadable, dropped, notes):
 # ---------------------------------------------------------------------------
 
 def _write_mapped(conn, mapped, producer, source, settings, received_at,
-                  content_sha256, unreadable_extra=0, unmapped=0):
+                  content_sha256, unreadable_extra=0, unmapped=0,
+                  graph_derivation=GRAPH_DERIVATION):
     """Write mapped documents to the ledger and build the receipt.
 
     mapped is a map_spans() result. First write wins per (trace_id,
     span_id): identical re-delivery is noted as a duplicate, a changed
     re-delivery as a conflict, and neither overwrites the stored row.
+    graph_derivation records the derivation claimed for the documents in
+    this import (D-F1); import_canonical_document passes the incoming
+    document's own run-metadata label instead of the mapper constant.
     """
     documents = mapped["documents"]
     notes = list(mapped["notes"])
@@ -368,7 +383,8 @@ def _write_mapped(conn, mapped, producer, source, settings, received_at,
         "producer": producer,
         "received_at": received_at,
     }
-    receipt = _record_receipt(conn, import_row, span_rows, event_rows, run_ids, settings)
+    receipt = _record_receipt(conn, import_row, span_rows, event_rows, run_ids, settings,
+                              graph_derivation=graph_derivation)
     return receipt
 
 
@@ -528,8 +544,15 @@ def import_canonical_document(conn, document, producer, settings=None,
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
     }
+    # The receipt records the derivation the incoming document claims
+    # for itself (D-F1): a fleet-mapped document carries the tree label
+    # in run metadata; a foreign document carries whatever it claims,
+    # or nothing at all — the receipt never invents a derivation.
+    metadata = run.get("metadata") if isinstance(run, dict) else None
+    claimed = metadata.get("graph") if isinstance(metadata, dict) else None
+    graph_derivation = claimed if isinstance(claimed, str) else None
     receipt = _write_mapped(conn, mapped, producer, source, settings, received_at,
-                            content_sha256)
+                            content_sha256, graph_derivation=graph_derivation)
     if not canonical_spans:
         ledger_mod.set_run_partial(conn, trace_id, receipt["import_id"])
     return receipt

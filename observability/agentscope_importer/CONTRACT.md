@@ -115,17 +115,17 @@ preserved). One upload = one trace = one run.
 | `gen_ai.request.model` + usage | `span.llm` | **Token fix (M3/M4 follow-up):** tokens are carried on `span.llm` with `supports_token_usage=true`, so the import receipt reports real token totals. The collector's `build_feed` only sums spans named exactly `"llm"` and therefore reports 0 for fleet spans — that is a collector-side quirk, NOT the import contract: the import carries the tokens, and the receipt proves it. Fixing `build_feed` itself is out of scope here (different repo); it is recorded as a follow-up. |
 | state content | NEVER carried | State spans map to kind `other` with an opaque reference only (`attributes["fleet.state_ref"]` when a ref exists). "Safe state references" means references, never content. |
 | span events (OTLP payload input only) | canonical `events` | `native_id = "<trace>:<span>:ev/<index>"`, `type` = event name, `data` = event attributes (or `{}`). The receiver's flattened form drops events, so event mapping only applies to raw-payload input. |
-| graph | `{nodes, edges, entry}` | **Transcribed from recorded parent links, and labelled as such.** Nodes: one per span, `name` = span `native_id` (unique), `kind` = mapped kind, `attributes.fleet.span` = original name. Edges: `{"from": parent, "to": child, "kind": "static"}` for every recorded parent link. `entry` = root span `native_id`. This is a faithful transcription of observed structure, not inferred state: every edge corresponds to a recorded `parentSpanId`. The capability flag `supports_graph_topology=true` asserts the source can supply topology — it can, because parentage is recorded on every fleet span. The derivation is documented here, in the import document's run metadata, and in the evidence, so a reviewer can challenge it. No graph is supplied when there are no spans (the run is then `partial`, as in the real importer). |
+| graph | *(not emitted)* | **D-F1 tree correction (ADR-005): no `graph` section is emitted.** The fleet graph would be a span hierarchy — one node per span, edges = recorded parent links — not a framework topology, so labelling it `native` would overstate what is known (ADR-005: "A span hierarchy is not a LangGraph topology"). Parentage stays recorded on every span (`span.parent_native_id`, verbatim; dangling → null + note), and AgentScope renders the run as a tree (`compute_graph` → `tree`). The derivation is labelled in the document's run metadata (`"graph": "tree-from-recorded-parentage"`) and in the receipt provenance (`graph_derivation`), so a reviewer can challenge it. The capability flag is `supports_graph_topology=false`. |
 | run status | `error` if any span errors, else `ok` if all ok, else `unknown` | |
 | run times | min span start / max span end | Always derived from span times (fleet spans carry no run-level times); the derivation is a defined mapping rule, recorded in run metadata. |
-| run metadata | `{"fleet_schema_version": "1", "producer": <agent>, "trace_id": <traceId>, "graph": "transcribed-from-parentage"}` | Provenance, visible in the document. |
+| run metadata | `{"fleet_schema_version": "1", "producer": <agent>, "trace_id": <traceId>, "graph": "tree-from-recorded-parentage"}` | Provenance, visible in the document. The `"graph"` label states the derivation (D-F1): the graph is rendered as a tree from recorded parentage, not a framework topology. |
 
 Source block (every document):
 ```json
 {"adapter": "canonical", "framework": "fleet-tracing",
  "framework_version": "1",
  "capabilities": {
-   "supports_spans": true, "supports_graph_topology": true,
+   "supports_spans": true, "supports_graph_topology": false,
    "supports_node_execution_mapping": false,
    "supports_state_snapshots": false, "supports_checkpoints": false,
    "supports_interrupts": false, "supports_token_usage": true,
@@ -201,8 +201,28 @@ Every import returns an `ImportReceipt` (dict + stored row):
  "tokens_in": N, "tokens_out": N,
  "provenance": {"producer": "copilot", "feed": "fleet-tracing",
                 "schema_version": "0.1",
+                "graph_derivation": "tree-from-recorded-parentage",
                 "content_sha256": "<64 hex>", "received_at": "<ISO>"}}
 ```
+
+Two ladders, not one — D-F1 (ADR-005). The AgentScope ImportReport
+quality and the fleet receipt quality measure different things, and
+they must not be conflated. The ImportReport quality is `partial`
+for every fleet run under the tree derivation
+(`normalize.py:658` — `partial = graph.mode != GraphMode.native or
+not redacted.spans`); that is the product's ladder and is not a
+choice. The fleet receipt quality is the fleet's own import
+accounting, first match wins: `unsupported` (no adapter) →
+`invalid` (no run imported) → `partial` (a run dropped, unreadable
+records, or a run with no spans) → `warnings` (imported, not
+partial, warnings non-empty) → `complete` (all spans imported, no
+drops, no unreadable records, no empty-span runs). The tree
+derivation does **not** change the fleet receipt quality: it is
+recorded in the document's run metadata and in the receipt
+provenance (`graph_derivation`), never by downgrading the receipt.
+§2's "no native graph → partial" clause belongs to the ImportReport
+ladder, not to this receipt. A receipt for an unsupported/invalid
+outcome carries no `graph_derivation` claim.
 
 Quality mirrors the real importer (§2), first match wins. A
 duplicate-content import returns the **original** receipt with
@@ -246,10 +266,13 @@ dropped); parent cycle (run dropped); restart recovery;
 native-ID preservation; token totals real; receipt on every step;
 OTLP content types (JSON accepted, protobuf refused); no
 raw-payload storage. The real-import check
-(`examples/verify_agentscope_import.py`) additionally runs
+(`observability/examples/verify_agentscope_import.py`) additionally runs
 the mapped document through the REAL `import_bytes` when an
 AgentScope checkout (`AGENTSCOPE_SRC`) and pydantic are
 available, and skips cleanly otherwise with the reason printed.
+Under the tree derivation the real-import check expects ImportReport
+quality `partial` (the product ladder); the fleet receipt quality
+stays `complete` for a clean import (the accounting ladder, §5).
 
 ## 8. What M5 does NOT do
 

@@ -22,7 +22,11 @@ SOURCE = {
     "framework_version": FLEET_SCHEMA_VERSION,
     "capabilities": {
         "supports_spans": True,
-        "supports_graph_topology": True,
+        # D-F1 tree correction (ADR-005): the fleet graph is a span
+        # hierarchy, not a framework topology, so the mapper emits no
+        # `graph` section and this flag is False. Parentage stays
+        # recorded on spans; AgentScope renders the run as a tree.
+        "supports_graph_topology": False,
         "supports_node_execution_mapping": False,
         "supports_state_snapshots": False,
         "supports_checkpoints": False,
@@ -31,6 +35,12 @@ SOURCE = {
         "supports_cost": False,
     },
 }
+
+# Graph derivation label (D-F1 tree correction, ADR-005): recorded in the
+# import document's run metadata and in the receipt provenance. It states
+# that the graph is rendered as a tree from recorded parentage — not a
+# framework topology. See CONTRACT.md §3 and §5.
+GRAPH_DERIVATION = "tree-from-recorded-parentage"
 
 # Fleet span name -> canonical SpanKind.
 KIND_MAP = {
