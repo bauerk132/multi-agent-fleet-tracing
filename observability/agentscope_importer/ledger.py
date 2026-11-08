@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS imports (
     tokens_in INTEGER NOT NULL,
     tokens_out INTEGER NOT NULL,
     producer TEXT,
+    graph_derivation TEXT,
     received_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS spans (
@@ -92,6 +93,9 @@ def open_ledger(path):
     columns = {row["name"] for row in conn.execute("SELECT name FROM pragma_table_info('spans')")}
     if "attributes_json" not in columns:
         conn.execute("ALTER TABLE spans ADD COLUMN attributes_json TEXT NOT NULL DEFAULT '{}'")
+    import_columns = {row["name"] for row in conn.execute("SELECT name FROM pragma_table_info('imports')")}
+    if "graph_derivation" not in import_columns:
+        conn.execute("ALTER TABLE imports ADD COLUMN graph_derivation TEXT")
     conn.commit()
     return conn
 
@@ -111,12 +115,15 @@ def get_receipt(conn, import_id):
 
 
 def _receipt_from_row(row):
+    run_ids = json.loads(row["run_ids_json"])
+    if isinstance(run_ids, dict):
+        run_ids = list(run_ids.values())
     return {
         "import_id": row["import_id"],
         "quality": row["quality"],
         "warnings": json.loads(row["warnings_json"]),
         "stats": json.loads(row["stats_json"]),
-        "run_ids": json.loads(row["run_ids_json"]),
+        "run_ids": run_ids,
         "tokens_in": row["tokens_in"],
         "tokens_out": row["tokens_out"],
         "provenance": {
@@ -125,6 +132,7 @@ def _receipt_from_row(row):
             "schema_version": row["schema_version"],
             "content_sha256": row["content_sha256"],
             "received_at": row["received_at"],
+            **({"graph_derivation": row["graph_derivation"]} if row["graph_derivation"] else {}),
         },
     }
 
@@ -174,8 +182,8 @@ def record_import(conn, import_row, span_rows, event_rows, run_ids):
         conn.execute(
             "INSERT INTO imports"
             " (import_id, content_sha256, schema_version, quality, stats_json,"
-            "  warnings_json, run_ids_json, tokens_in, tokens_out, producer, received_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  warnings_json, run_ids_json, tokens_in, tokens_out, producer, received_at, graph_derivation)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 import_row["import_id"],
                 import_row["content_sha256"],
@@ -188,6 +196,7 @@ def record_import(conn, import_row, span_rows, event_rows, run_ids):
                 import_row["tokens_out"],
                 import_row["producer"],
                 import_row["received_at"],
+                import_row.get("graph_derivation"),
             ),
         )
         for span in span_rows:

@@ -1,7 +1,9 @@
 """CLI for the M5 AgentScope importer.
 
-Usage (run from the repo root):
+Usage (run from the observability/ directory):
   python -m agentscope_importer import <file> [--data-dir DIR] [--producer NAME]
+  python -m agentscope_importer deliver <file> [--data-dir DIR] [--producer NAME]
+      [--server http://127.0.0.1:8765]
   python -m agentscope_importer verify [--data-dir DIR]
   python -m agentscope_importer receipt <import_id> [--data-dir DIR]
   python -m agentscope_importer purge [--data-dir DIR]
@@ -89,6 +91,28 @@ def _cmd_stats(args):
     return 0
 
 
+def _cmd_deliver(args):
+    from agentscope_importer.bridge import BridgeError, deliver_snapshot, snapshot_source, validate_server
+
+    try:
+        validate_server(args.server)
+        raw = snapshot_source(args.file, ImportSettings().max_bytes_per_import)
+        token = os.environ.get("AGENTSCOPE_TOKEN")
+        if not token:
+            import getpass
+            token = getpass.getpass("AgentScope token: ")
+        conn = ledger_mod.open_ledger(_ledger_path(args.deliver_data_dir or args.data_dir))
+        try:
+            result = deliver_snapshot(conn, raw, args.producer, args.server, token)
+        finally:
+            conn.close()
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result.get("verified") else 1
+    except BridgeError as exc:
+        print(json.dumps({"outcome": exc.outcome, "error": str(exc)}, sort_keys=True), file=sys.stderr)
+        return 1
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="agentscope_importer")
     parser.add_argument("--data-dir", default=None, help="ledger directory (default: local state dir)")
@@ -111,6 +135,13 @@ def main(argv=None):
 
     p_stats = sub.add_parser("stats", help="ledger counts")
     p_stats.set_defaults(func=_cmd_stats)
+
+    p_deliver = sub.add_parser("deliver", help="deliver one canonical run to loopback AgentScope")
+    p_deliver.add_argument("file")
+    p_deliver.add_argument("--producer", default="fleet-tracing")
+    p_deliver.add_argument("--server", default="http://127.0.0.1:8765")
+    p_deliver.add_argument("--data-dir", dest="deliver_data_dir", default=None)
+    p_deliver.set_defaults(func=_cmd_deliver)
 
     args = parser.parse_args(argv)
     return args.func(args)

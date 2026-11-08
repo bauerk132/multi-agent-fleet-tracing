@@ -54,7 +54,8 @@ AgentScope importer accepts; see "Real-import check" below.
 - `ledger.py` — SQLite ledger (imports / spans / events / runs).
 - `importer.py` — the import operation + receipt + quality ladder.
 - `verify.py` — the CLI assertion scenario + the real-import check.
-- `cli.py` — `import` / `verify` / `receipt` / `purge` / `stats`.
+- `bridge.py` — frozen-snapshot validation, privacy allowlist, loopback transport, and semantic readback.
+- `cli.py` — `import` / `deliver` / `verify` / `receipt` / `purge` / `stats`.
 
 ## CLI
 
@@ -63,15 +64,63 @@ Run from the `observability/` directory:
 ```
 python -m agentscope_importer verify
 python -m agentscope_importer import <file> [--producer NAME]
+python -m agentscope_importer deliver <file> [--data-dir DIR] [--producer NAME]
+    [--server http://127.0.0.1:8765]
 python -m agentscope_importer receipt <import_id>
 python -m agentscope_importer purge
 python -m agentscope_importer stats
 ```
 
-`verify` runs the full contract assertion (14 checks) against a fresh
+`verify` runs the full contract assertion (15 checks) against a fresh
 temporary ledger and exits 0 only if every check passes. It never
 touches the default ledger (`~/.local/share/fleet-tracing/`,
 or `$FLEET_LEDGER_DIR`).
+
+`deliver` accepts a canonical `0.1` document, a JSON array/JSONL of flattened
+Fleet spans, or OTLP/HTTP JSON. It reads the source once into a bounded
+16 MiB byte snapshot, validates the source and mapped canonical document
+against the M4 metadata allowlist and a restricted safe-value format
+(rejecting prose, credential-like values, and absolute paths), imports that
+exact snapshot into the local Fleet ledger, and POSTs the deterministic
+`canonical_bytes(document)` bytes. Validation happens before either local
+persistence or upload.
+The result keeps the raw snapshot SHA-256 separate from each canonical-upload
+SHA-256 and records a per-trace crosswalk between Fleet run IDs and locally
+predicted AgentScope import/run IDs. Warning counts preserve duplicate warning
+occurrences. Token totals are `null` when no complete total is known; an
+explicit reported zero remains `0`.
+
+The endpoint must be plain HTTP on an explicit literal loopback IP
+(`127.0.0.0/8` or `::1`). DNS names, environment proxies, and redirects are
+refused. Supply the one-launch token through `AGENTSCOPE_TOKEN` or the hidden
+interactive prompt; there is no token flag. Use a dedicated `--data-dir` for
+isolated synthetic runs.
+
+The bridge checks the POST and persisted ImportReports, RunDetail status,
+quality, tree mode and capabilities, RunSummary timestamps, and every returned
+SpanView's IDs, parentage, timestamps, duration, status, attributes,
+LLM/tool/error metadata, and absence of payload/cost fields. It accepts only
+the exact safe AgentScope source reference `{"pointer":"/spans/<index>"}`
+for each span. Span readback uses explicit `limit=200` and increasing offsets
+(the endpoint's plain-list contract; its maximum is 200), and fails on repeated
+or non-progressing pages. Authentication failure stops remaining run uploads;
+those runs are reported as unattempted. ImportReport `partial`
+quality remains partial; the bridge does not upgrade the AgentScope quality
+to the Fleet receipt's separate quality ladder. AgentScope exposes no event
+readback endpoint, so the bridge refuses documents with non-empty events
+before local persistence or transmission. `verified` means the exposed API
+projection matched these checks; it is not direct database inspection, and
+RunDetail itself does not expose the native trace ID or import ownership.
+Those are linked through the persisted import's run IDs and each span's
+native ID/`fleet.trace` metadata. No live integration proof is claimed until
+an operator runs the command against the pinned isolated server.
+
+Run the synthetic bridge tests and importer contract check from `observability/`:
+
+```
+python -m unittest tests.test_agentscope_bridge -v
+python -m agentscope_importer verify
+```
 
 ## Real-import check
 
