@@ -17,13 +17,16 @@ from datetime import datetime, timezone
 from copilot_plugin._sanitize import SAFE_ATTRIBUTE_KEYS, SAFE_ERROR_MESSAGES, SAFE_ERROR_TYPES
 
 from .contract import (
+    DEFAULT_KIND,
     FLEET_SCHEMA_VERSION,
     GRAPH_DERIVATION,
+    KIND_MAP,
     MAX_BYTES_PER_IMPORT,
     MAX_SPANS_PER_IMPORT,
     SCHEMA_VERSION,
     SOURCE,
     STATS_KEYS,
+    STRIPPED_KEYS,
 )
 from .importer import ImportRefused, ImportSettings, flatten_otlp_payload, import_bytes
 from .mapper import canonical_bytes, map_spans, run_id_for
@@ -111,6 +114,60 @@ COPILOT_SPAN_NAMES = {
     "execute_tool": "tool.exec",
 }
 
+# Real Copilot OTel file-exporter shape (observed 2026-11-09,
+# copilot-otel.jsonl): JSONL of mixed span + metric records. Span
+# records carry [seconds, nanoseconds] time pairs, an
+# instrumentationScope, and SDK fields the flat-span contract does not
+# use. Only the keys below are recognized on a span record; anything
+# else rejects that record (fail closed, counted in the normalization
+# report — never silent). Metric records carry scopeMetrics and are
+# counted and excluded from the span mapper; they are not imported.
+EXPORTER_SPAN_KEYS = frozenset({
+    "traceId", "spanId", "parentSpanId", "name", "startTime", "endTime",
+    "duration", "ended", "events", "attributes", "status", "resource",
+    "instrumentationScope", "kind", "traceFlags",
+    "droppedAttributesCount", "droppedEventsCount", "droppedLinksCount",
+    "links",
+})
+# A span record carrying any of these keys is a real-exporter record,
+# not an ordinary flat span. Ordinary flat spans (startTimeUnixNano,
+# canonical names) keep the existing strict path.
+EXPORTER_SPAN_MARKERS = frozenset({
+    "startTime", "endTime", "duration", "instrumentationScope",
+    "traceFlags", "ended", "droppedAttributesCount", "droppedEventsCount",
+    "droppedLinksCount", "links",
+})
+EXPORTER_SCOPE_KEYS = frozenset(
+    {"name", "version", "attributes", "droppedAttributesCount"}
+)
+EXPORTER_RESOURCE_KEYS = frozenset({"attributes", "droppedAttributesCount"})
+EXPORTER_METRIC_KEYS = frozenset({"resource", "scopeMetrics"})
+# OTLP log records (observed 2026-11-09, copilot-otelrun2.jsonl): flat
+# log shape, no scopeLogs wrapper. Counted and excluded from the span
+# mapper; never imported. Only the keys below are recognized; anything
+# else rejects that record (fail closed, counted in the report).
+EXPORTER_LOG_KEYS = frozenset({
+    "attributes", "body", "droppedAttributesCount", "hrTime",
+    "hrTimeObserved", "instrumentationScope", "resource",
+})
+# Largest [seconds, nanos] pair convertible to an ISO timestamp: the
+# mapper's ns_to_iso uses datetime.fromtimestamp, which overflows past
+# year 9999. Bounding seconds here keeps conversion total.
+MAX_HR_SECONDS = 253402300799  # 9999-12-31T23:59:59Z
+# The exporter's unclassified error.type value. It is mapped to a
+# bounded SAFE_ERROR_TYPES class (never carried verbatim, never used
+# to invent a more specific failure than the span kind supports).
+REAL_EXPORTER_ERROR_TYPE = "Error"
+
+
+class _RealExporterReject(Exception):
+    """One real-exporter record is malformed or unsupported.
+
+    Carries only a short machine reason (no raw values, no error
+    strings); the classifier records the reason and the record's
+    trace/span ids in the normalization report and moves on.
+    """
+
 
 def _normalize_live_attributes(attrs, allowed=ATTRIBUTE_ALLOWLIST):
     """Drop attribute entries whose key is outside `allowed`.
@@ -190,6 +247,429 @@ def _normalize_live_otlp(payload):
                 renamed += count_renamed
                 dropped += count_dropped
     return renamed, dropped
+
+
+def _hr_time_to_ns(value, where):
+    """[seconds, nanoseconds] pair -> Unix nanoseconds (validated).
+
+    Both elements must be plain ints; seconds must be in range and
+    nanoseconds in 0..999,999,999. Anything else rejects the record.
+    """
+    if (
+        not isinstance(value, (list, tuple)) or len(value) != 2
+        or isinstance(value[0], bool) or not isinstance(value[0], int)
+        or isinstance(value[1], bool) or not isinstance(value[1], int)
+        or value[0] < 0 or value[0] > MAX_HR_SECONDS
+        or value[1] < 0 or value[1] > 999_999_999
+    ):
+        raise _RealExporterReject("malformed_timestamp")
+    return value[0] * 1_000_000_000 + value[1]
+
+
+def _real_exporter_error_message(kind):
+    """Bounded safe error message for a failed real-exporter span.
+
+    The exporter's raw status message is never carried; the failure
+    fact survives as status error plus this approved message.
+    """
+    if kind == "llm":
+        return "LLM call failed; details withheld"
+    if kind == "tool":
+        return "Tool failed; details withheld"
+    return "Error; details withheld"
+
+
+def _real_exporter_error_type(kind):
+    """Bounded safe error.type for the exporter's unclassified "Error"."""
+    return "LLMError" if kind == "llm" else "Unknown"
+
+
+def _normalize_real_exporter_span(span, report):
+    """Convert one real-exporter span record to the approved flat shape.
+
+    Returns a flat span dict whose keys are a subset of RAW_SPAN_KEYS,
+    ready for the existing _validate_flat_spans + map_spans path.
+    Raises _RealExporterReject with a short machine reason when the
+    record is malformed or unsupported; the caller records the reason
+    and skips the record. Nothing raw is carried forward: error
+    strings are replaced by bounded classes, exception events (and
+    their stack traces) are dropped and counted, and non-allowlisted
+    attributes are dropped and counted.
+    """
+    if not isinstance(span, dict):
+        raise _RealExporterReject("not_an_object")
+    if set(span) - EXPORTER_SPAN_KEYS:
+        raise _RealExporterReject("unapproved_span_field")
+    attrs = span.get("attributes")
+    if not isinstance(attrs, dict):
+        raise _RealExporterReject("malformed_attributes")
+
+    # Gap A — narrow model-suffixed chat name. The name must be exactly
+    # "chat <model>" with the model taken from the span's own
+    # gen_ai.request.model attribute and gen_ai.operation.name == "chat".
+    # No wildcard rename: any other non-canonical name rejects the record.
+    # Gap A (run2) — narrow model-suffixed embeddings name, same shape:
+    # "embeddings <model>" with gen_ai.operation.name == "embeddings"
+    # normalizes to llm.call (it is a model invocation). It is NEVER
+    # labeled tool.exec; the operation name survives in the carried
+    # allowlisted attributes, so provenance is kept.
+    raw_name = span.get("name")
+    operation = attrs.get("gen_ai.operation.name")
+    model = attrs.get("gen_ai.request.model")
+    # The model value feeds the rename decision, so an unsafe value
+    # refuses the whole snapshot here (fail closed, like the flat path)
+    # instead of hiding inside a per-record rejection.
+    if isinstance(model, str):
+        _safe_text(model, "model name")
+    if isinstance(raw_name, str) and raw_name in COPILOT_SPAN_NAMES:
+        name = COPILOT_SPAN_NAMES[raw_name]
+        report["renamed_spans"] += 1
+    elif isinstance(raw_name, str) and raw_name in SPAN_NAMES:
+        name = raw_name
+    elif (
+        isinstance(raw_name, str)
+        and operation == "chat"
+        and isinstance(model, str) and model
+        and raw_name == "chat " + model
+    ):
+        name = "llm.call"
+        report["renamed_spans"] += 1
+        report["model_suffixed_renames"] += 1
+    elif (
+        isinstance(raw_name, str)
+        and operation == "embeddings"
+        and isinstance(model, str) and model
+        and raw_name == "embeddings " + model
+    ):
+        name = "llm.call"
+        report["renamed_spans"] += 1
+        report["model_suffixed_renames"] += 1
+        report["embeddings_renames"] += 1
+    else:
+        raise _RealExporterReject("unsupported_span_name")
+    kind = KIND_MAP.get(name, DEFAULT_KIND)
+
+    # Gap B — [seconds, nanoseconds] pairs to Unix nanoseconds.
+    # Never substitute wall-clock ingestion time.
+    if "startTime" not in span or "endTime" not in span:
+        raise _RealExporterReject("missing_timestamp")
+    start_ns = _hr_time_to_ns(span["startTime"], "span start")
+    end_ns = _hr_time_to_ns(span["endTime"], "span end")
+    if end_ns < start_ns:
+        raise _RealExporterReject("end_before_start")
+    if "duration" in span and span["duration"] is not None:
+        duration_ns = _hr_time_to_ns(span["duration"], "span duration")
+        if duration_ns != end_ns - start_ns:
+            raise _RealExporterReject("duration_mismatch")
+
+    # Gap D — SDK fields: validated, then dropped (the mapper recomputes
+    # duration from start/end and never uses these).
+    if span.get("ended") is not True:
+        raise _RealExporterReject("span_not_ended")
+    for field in ("droppedAttributesCount", "droppedEventsCount", "droppedLinksCount"):
+        count = span.get(field, 0)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise _RealExporterReject("malformed_dropped_count")
+        if count > 0:
+            raise _RealExporterReject("upstream_dropped_data")
+    report["dropped_counts_verified_zero"] += 1
+    links = span.get("links", [])
+    if not isinstance(links, list):
+        raise _RealExporterReject("malformed_links")
+    if links:
+        raise _RealExporterReject("span_links_not_approved")
+    flags = span.get("traceFlags", 0)
+    if isinstance(flags, bool) or not isinstance(flags, int) or not 0 <= flags <= 255:
+        raise _RealExporterReject("malformed_trace_flags")
+    sdk_kind = span.get("kind")
+    if sdk_kind is not None and (isinstance(sdk_kind, bool) or not isinstance(sdk_kind, int)):
+        raise _RealExporterReject("malformed_span_kind")
+
+    # Gap D — instrumentationScope -> flat scope {name, version}.
+    # The flat contract carries no scope attributes, so any present are
+    # dropped and counted.
+    flat_scope = None
+    scope = span.get("instrumentationScope")
+    if scope is not None:
+        if not isinstance(scope, dict) or set(scope) - EXPORTER_SCOPE_KEYS:
+            raise _RealExporterReject("malformed_scope")
+        scope_dropped = scope.get("droppedAttributesCount", 0)
+        if isinstance(scope_dropped, bool) or not isinstance(scope_dropped, int) or scope_dropped < 0:
+            raise _RealExporterReject("malformed_dropped_count")
+        if scope_dropped > 0:
+            raise _RealExporterReject("upstream_dropped_data")
+        flat_scope = {}
+        for field in ("name", "version"):
+            value = scope.get(field)
+            if value is not None:
+                _safe_text(value, "scope")
+                flat_scope[field] = value
+        scope_attrs = scope.get("attributes")
+        if scope_attrs is not None:
+            if isinstance(scope_attrs, dict):
+                report["dropped_attributes"] += len(scope_attrs)
+            elif isinstance(scope_attrs, list):
+                report["dropped_attributes"] += len(scope_attrs)
+            else:
+                raise _RealExporterReject("malformed_scope")
+
+    # Gap D — resource: keep only service.name / service.version.
+    # Session ids and SDK internals are dropped and counted, never
+    # promoted to span attributes.
+    flat_resource = None
+    resource = span.get("resource")
+    if resource is not None:
+        if not isinstance(resource, dict) or set(resource) - EXPORTER_RESOURCE_KEYS:
+            raise _RealExporterReject("malformed_resource")
+        resource_dropped = resource.get("droppedAttributesCount", 0)
+        if isinstance(resource_dropped, bool) or not isinstance(resource_dropped, int) or resource_dropped < 0:
+            raise _RealExporterReject("malformed_dropped_count")
+        if resource_dropped > 0:
+            raise _RealExporterReject("upstream_dropped_data")
+        res_attrs = resource.get("attributes")
+        kept_resource = {}
+        if res_attrs is not None:
+            if isinstance(res_attrs, dict):
+                for key, value in res_attrs.items():
+                    if key in {"service.name", "service.version"}:
+                        _safe_text(value, "resource")
+                        kept_resource[key] = value
+                    else:
+                        report["dropped_attributes"] += 1
+            elif isinstance(res_attrs, list):
+                for entry in res_attrs:
+                    if not isinstance(entry, dict) or set(entry) - {"key", "value"}:
+                        raise _RealExporterReject("malformed_resource")
+                    key = entry.get("key")
+                    if key in {"service.name", "service.version"}:
+                        try:
+                            value = _decode_otlp_value(entry.get("value"), "resource")
+                        except BridgeError:
+                            raise _RealExporterReject("malformed_resource") from None
+                        _safe_text(value, "resource")
+                        kept_resource[key] = value
+                    else:
+                        report["dropped_attributes"] += 1
+            else:
+                raise _RealExporterReject("malformed_resource")
+        if kept_resource:
+            flat_resource = {"attributes": kept_resource}
+
+    # Gaps A/D/E — span attributes: allowlist only, stripped keys dropped.
+    # error.type "Error" maps to a bounded class; error.message strings
+    # map to a bounded safe message. Anything else unsafe is refused
+    # downstream by _validate_flat_spans (fail closed).
+    kept_attrs = {}
+    for key, value in attrs.items():
+        if key in STRIPPED_KEYS or key not in ATTRIBUTE_ALLOWLIST:
+            report["dropped_attributes"] += 1
+            continue
+        if key == "error.type":
+            if not isinstance(value, str):
+                raise _RealExporterReject("malformed_error_type")
+            if value in SAFE_ERROR_TYPES:
+                kept_attrs[key] = value
+            elif value == REAL_EXPORTER_ERROR_TYPE:
+                kept_attrs[key] = _real_exporter_error_type(kind)
+                report["error_types_mapped"] += 1
+            else:
+                raise _RealExporterReject("unapproved_error_type")
+            continue
+        if key == "error.message":
+            if not isinstance(value, str):
+                raise _RealExporterReject("malformed_error_message")
+            if value in SAFE_ERROR_MESSAGES:
+                kept_attrs[key] = value
+            else:
+                kept_attrs[key] = _real_exporter_error_message(kind)
+                report["error_messages_sanitized"] += 1
+            continue
+        kept_attrs[key] = value
+
+    # Gap E — status: the error code is preserved; a raw message is
+    # replaced by the bounded safe message for the span kind.
+    flat_status = None
+    status = span.get("status")
+    if status is not None:
+        if not isinstance(status, dict) or set(status) - {"code", "message"}:
+            raise _RealExporterReject("malformed_status")
+        code = status.get("code", 0)
+        if isinstance(code, bool) or code not in (0, 1, 2):
+            raise _RealExporterReject("unapproved_status")
+        message = status.get("message")
+        if message is not None:
+            if not isinstance(message, str):
+                raise _RealExporterReject("malformed_status")
+            if message in SAFE_ERROR_MESSAGES:
+                flat_status = {"code": code, "message": message}
+            elif code == 2:
+                flat_status = {"code": code, "message": _real_exporter_error_message(kind)}
+                report["error_messages_sanitized"] += 1
+            else:
+                raise _RealExporterReject("unapproved_span_error_message")
+        else:
+            flat_status = {"code": code}
+
+    # Gap E — events: exception events are sanitized away (their stack
+    # traces never enter any document) and counted; every other event
+    # is dropped and counted. The failure fact survives on the span
+    # status and bounded error type. The bridge refuses event-bearing
+    # documents (no event readback), so no event is carried forward.
+    events = span.get("events", [])
+    if not isinstance(events, list):
+        raise _RealExporterReject("malformed_events")
+    for event in events:
+        if not isinstance(event, dict):
+            raise _RealExporterReject("malformed_events")
+        if event.get("name") == "exception":
+            report["exception_events_sanitized"] += 1
+        else:
+            report["events_dropped"] += 1
+
+    flat = {
+        "traceId": span.get("traceId"),
+        "spanId": span.get("spanId"),
+        "name": name,
+        "startTimeUnixNano": start_ns,
+        "endTimeUnixNano": end_ns,
+        "attributes": kept_attrs,
+    }
+    parent = span.get("parentSpanId")
+    if parent is not None:
+        flat["parentSpanId"] = parent
+    if flat_status is not None:
+        flat["status"] = flat_status
+    if flat_resource is not None:
+        flat["resource"] = flat_resource
+    if flat_scope is not None:
+        flat["scope"] = flat_scope
+    return flat
+
+
+def _validate_real_exporter_log(record):
+    """Validate an OTLP log record's shape; the record is counted and skipped.
+
+    Log records are never imported, so no content is carried forward —
+    only the shape is checked. Raises _RealExporterReject with a short
+    machine reason when the record is malformed.
+    """
+    if not isinstance(record, dict):
+        raise _RealExporterReject("not_an_object")
+    if set(record) - EXPORTER_LOG_KEYS:
+        raise _RealExporterReject("unapproved_log_field")
+    for field in ("hrTime", "hrTimeObserved"):
+        value = record.get(field)
+        if value is not None:
+            _hr_time_to_ns(value, "log time")
+    dropped = record.get("droppedAttributesCount", 0)
+    if isinstance(dropped, bool) or not isinstance(dropped, int) or dropped < 0:
+        raise _RealExporterReject("malformed_log_record")
+    body = record.get("body")
+    if body is not None and not isinstance(body, str):
+        raise _RealExporterReject("malformed_log_record")
+    attrs = record.get("attributes")
+    if attrs is not None and not isinstance(attrs, dict):
+        raise _RealExporterReject("malformed_log_record")
+    scope = record.get("instrumentationScope")
+    if scope is not None and (
+        not isinstance(scope, dict) or set(scope) - EXPORTER_SCOPE_KEYS
+    ):
+        raise _RealExporterReject("malformed_log_record")
+    resource = record.get("resource")
+    if resource is not None and not isinstance(resource, dict):
+        raise _RealExporterReject("malformed_log_record")
+
+
+def _normalize_live_records(records, normalization):
+    """Classify live JSONL/list records and normalize them in place.
+
+    Returns the kept flat spans. Metric records are recognized,
+    counted, and excluded from the span mapper; log records (hrTime +
+    body shape) are recognized, counted, and excluded the same way.
+    Exporter-shaped span records are normalized per record; a malformed
+    or unsupported one is rejected with its reason in the report (never
+    silent) and the run continues with the accepted spans. Ordinary flat
+    spans take the existing strict path (unknown names and unsafe values
+    still refuse the whole snapshot via _validate_flat_spans). Non-dict
+    records are rejected, not treated as spans.
+    """
+    kept = []
+    for record in records:
+        if not isinstance(record, dict):
+            normalization["spans_rejected"] += 1
+            normalization["rejected"].append(
+                {"reason": "not_an_object", "trace_id": None, "span_id": None}
+            )
+            continue
+        if (
+            "traceId" in record and "spanId" in record
+            and set(record) & EXPORTER_SPAN_MARKERS
+        ):
+            normalization["real_exporter_records"] += 1
+            try:
+                kept.append(_normalize_real_exporter_span(record, normalization))
+                normalization["spans_accepted"] += 1
+            except _RealExporterReject as exc:
+                normalization["spans_rejected"] += 1
+                normalization["rejected"].append({
+                    "reason": str(exc),
+                    "trace_id": record.get("traceId") if isinstance(record.get("traceId"), str) else None,
+                    "span_id": record.get("spanId") if isinstance(record.get("spanId"), str) else None,
+                })
+            continue
+        if "scopeMetrics" in record:
+            if set(record) - EXPORTER_METRIC_KEYS:
+                normalization["spans_rejected"] += 1
+                normalization["rejected"].append(
+                    {"reason": "unapproved_metric_field", "trace_id": None, "span_id": None}
+                )
+                continue
+            scope_metrics = record.get("scopeMetrics")
+            if not isinstance(scope_metrics, list):
+                normalization["spans_rejected"] += 1
+                normalization["rejected"].append(
+                    {"reason": "malformed_metric_record", "trace_id": None, "span_id": None}
+                )
+                continue
+            normalization["real_exporter_records"] += 1
+            normalization["metric_records"] += 1
+            normalization["metrics_skipped"] += 1
+            for entry in scope_metrics:
+                metrics = entry.get("metrics") if isinstance(entry, dict) else None
+                if isinstance(metrics, list):
+                    normalization["metric_descriptors"] += len(metrics)
+            continue
+        if "hrTime" in record and "body" in record:
+            # Gap C (run2) — OTLP log record: recognized, counted, and
+            # excluded from the span mapper. No log content is carried
+            # forward; a malformed log is rejected with its reason.
+            try:
+                _validate_real_exporter_log(record)
+            except _RealExporterReject as exc:
+                normalization["spans_rejected"] += 1
+                normalization["rejected"].append(
+                    {"reason": str(exc), "trace_id": None, "span_id": None}
+                )
+                continue
+            normalization["real_exporter_records"] += 1
+            normalization["log_records"] += 1
+            normalization["logs_skipped"] += 1
+            continue
+        if "traceId" not in record or "spanId" not in record:
+            # Neither a span nor a metric: reject with a reason instead
+            # of letting validation refuse the whole snapshot. (Live
+            # mode only; non-live input still refuses such records.)
+            normalization["spans_rejected"] += 1
+            normalization["rejected"].append(
+                {"reason": "unrecognized_record", "trace_id": None, "span_id": None}
+            )
+            continue
+        renamed, dropped = _normalize_live_span(record)
+        normalization["renamed_spans"] += renamed
+        normalization["dropped_attributes"] += dropped
+        kept.append(record)
+    normalization["records_total"] += len(records)
+    return kept
 
 
 def validate_server(url):
@@ -503,12 +983,48 @@ def _parse_source_snapshot(raw, producer, live=False):
     Live mode normalizes raw Copilot exporter observations before
     validation: Copilot OTel span names are renamed to the canonical
     vocabulary and attribute entries outside the allowlist are dropped
-    (counted, never silent). Canonical documents are never normalized;
-    they must already be valid. Returns (kind, parsed, documents,
-    normalization) where normalization is {"renamed_spans": int,
-    "dropped_attributes": int}.
+    (counted, never silent). Live JSONL/list input is classified per
+    record: metric records are counted and skipped, log records are
+    counted and skipped, real-exporter span records are converted from
+    the observed exporter shape ([seconds, nanos] times, model-suffixed
+    chat and embeddings names, SDK fields, bounded error classes) with
+    per-record rejection reasons in the normalization report, and
+    ordinary flat spans keep the existing strict path.
+    Canonical documents are never normalized; they must already be
+    valid. Returns (kind, parsed, documents, normalization) where
+    normalization carries the renamed/dropped counts plus the
+    real-exporter accounting (records, metrics/logs skipped, spans
+    accepted/rejected with reasons, error mappings, event sanitizing).
+    For JSONL input, parsed is (kept_spans, unreadable_lines) with the
+    kept spans already normalized.
     """
-    normalization = {"renamed_spans": 0, "dropped_attributes": 0}
+    normalization = {
+        "renamed_spans": 0,
+        "dropped_attributes": 0,
+        # Real-exporter accounting (Gap C): populated only when live
+        # JSONL/list input contains exporter-shaped records or metric
+        # records. All counts are exact; "rejected" carries only short
+        # machine reasons plus trace/span ids — never raw values or
+        # error strings.
+        "records_total": 0,
+        "real_exporter_records": 0,
+        "metric_records": 0,
+        "metrics_skipped": 0,
+        "metric_descriptors": 0,
+        "log_records": 0,
+        "logs_skipped": 0,
+        "spans_accepted": 0,
+        "spans_rejected": 0,
+        "rejected": [],
+        "unreadable_lines": 0,
+        "model_suffixed_renames": 0,
+        "embeddings_renames": 0,
+        "error_types_mapped": 0,
+        "error_messages_sanitized": 0,
+        "exception_events_sanitized": 0,
+        "events_dropped": 0,
+        "dropped_counts_verified_zero": 0,
+    }
     try:
         parsed = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
@@ -530,11 +1046,7 @@ def _parse_source_snapshot(raw, producer, live=False):
         return "otlp", parsed, documents, normalization
     if isinstance(parsed, list):
         if live:
-            for span in parsed:
-                if isinstance(span, dict):
-                    renamed, dropped = _normalize_live_span(span)
-                    normalization["renamed_spans"] += renamed
-                    normalization["dropped_attributes"] += dropped
+            parsed = _normalize_live_records(parsed, normalization)
         _validate_flat_spans(parsed)
         mapped = map_spans(parsed, producer)
         documents = [document for _, document in mapped["documents"]]
@@ -556,11 +1068,8 @@ def _parse_source_snapshot(raw, producer, live=False):
         except ValueError:
             unreadable_lines += 1
     if live:
-        for span in spans:
-            if isinstance(span, dict):
-                renamed, dropped = _normalize_live_span(span)
-                normalization["renamed_spans"] += renamed
-                normalization["dropped_attributes"] += dropped
+        spans = _normalize_live_records(spans, normalization)
+    normalization["unreadable_lines"] = unreadable_lines
     _validate_flat_spans(spans)
     mapped = map_spans(spans, producer)
     documents = [document for _, document in mapped["documents"]]
@@ -1288,6 +1797,32 @@ def _receipt_summary(receipt, documents=None):
     }
 
 
+def _import_input(raw, parsed, source_kind, live, normalization):
+    """Bytes the local Fleet import should consume for this snapshot.
+
+    Normally the raw snapshot itself. But when live mode processed
+    real-exporter records, the raw bytes contain metric records and
+    un-normalized exporter fields (session ids, raw error strings,
+    stack traces) that must never reach the ledger. The ledger must
+    store exactly the normalized spans the bridge delivers, so the
+    normalized spans are re-serialized as a JSON array and imported
+    instead. The re-serialization is deterministic (sorted keys,
+    compact separators), so re-import idempotency is preserved.
+    """
+    if not live or normalization.get("real_exporter_records", 0) <= 0:
+        return raw
+    if source_kind == "jsonl":
+        normalized_spans = parsed[0]
+    elif source_kind == "spans":
+        normalized_spans = parsed
+    else:
+        return raw
+    # JSON array, not JSONL: a one-span input re-serialized as JSONL
+    # would parse back as a single JSON object, which the importer
+    # reports "unsupported". The array form imports any span count.
+    return json.dumps(normalized_spans, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
 def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synthetic_only=False, live=False):
     """Validate, locally import, then deliver the same bounded source snapshot.
 
@@ -1334,7 +1869,7 @@ def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synth
         raise BridgeError("source snapshot could not be safely validated") from None
 
     try:
-        fleet_receipt = import_bytes(conn, raw, producer, settings=settings)
+        fleet_receipt = import_bytes(conn, _import_input(raw, parsed, source_kind, live, normalization), producer, settings=settings)
     except ImportRefused as exc:
         raise BridgeError("local Fleet import refused the snapshot") from None
     except (ValueError, TypeError, OverflowError, UnicodeError, RecursionError):

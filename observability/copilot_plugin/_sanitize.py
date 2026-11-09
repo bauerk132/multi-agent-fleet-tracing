@@ -43,6 +43,12 @@ SAFE_ATTRIBUTE_KEYS = frozenset(
         "error.message",
         "gen_ai.provider.name",
         "gen_ai.request.model",
+        # M7-B real exporter: operation provenance for model-suffixed
+        # renames ("chat <model>", "embeddings <model>" -> llm.call).
+        # A bounded operation enum (chat/embeddings/...) with no content
+        # fields; without it a chat call and an embeddings call would be
+        # indistinguishable once both map to llm.call.
+        "gen_ai.operation.name",
         "gen_ai.response.model",
         "gen_ai.usage.input_tokens",
         "gen_ai.usage.output_tokens",
