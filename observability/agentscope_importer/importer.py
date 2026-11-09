@@ -190,7 +190,7 @@ def _receipt(import_id, quality, warnings, stats, run_ids, tokens_in, tokens_out
         "quality": quality,
         "warnings": clean_warnings,
         "stats": {key: stats.get(key, 0) for key in STATS_KEYS},
-        "run_ids": list(run_ids),
+        "run_ids": list(run_ids.values()) if isinstance(run_ids, dict) else list(run_ids),
         "already_imported": already_imported,
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
@@ -200,6 +200,8 @@ def _receipt(import_id, quality, warnings, stats, run_ids, tokens_in, tokens_out
 
 def _record_receipt(conn, import_row, span_rows, event_rows, run_ids, settings,
                     graph_derivation=None):
+    import_row = dict(import_row)
+    import_row["graph_derivation"] = graph_derivation
     ledger_mod.record_import(conn, import_row, span_rows, event_rows, run_ids)
     ledger_mod.purge(conn, settings.max_imports, settings.max_age_days, import_row["received_at"])
     return _receipt(
@@ -382,6 +384,7 @@ def _write_mapped(conn, mapped, producer, source, settings, received_at,
         "tokens_out": mapped["tokens_out"],
         "producer": producer,
         "received_at": received_at,
+        "graph_derivation": graph_derivation,
     }
     receipt = _record_receipt(conn, import_row, span_rows, event_rows, run_ids, settings,
                               graph_derivation=graph_derivation)
@@ -558,16 +561,16 @@ def import_canonical_document(conn, document, producer, settings=None,
     return receipt
 
 
-def import_file(conn, path, producer, settings=None, source="fleet-tracing",
+def import_bytes(conn, raw, producer, settings=None, source="fleet-tracing",
                 received_at=None):
-    """Import a file: canonical JSON, OTLP JSON, span JSON array, or JSONL."""
+    """Import one immutable byte snapshot using the normal M5 adapters."""
     settings = settings or ImportSettings()
     received_at = received_at or now_iso()
-    with open(path, "rb") as handle:
-        raw = handle.read()
+    if not isinstance(raw, bytes):
+        raise ImportRefused("input snapshot must be bytes")
     if len(raw) > settings.max_bytes_per_import:
         raise ImportRefused(
-            "file of %d bytes exceeds max_bytes_per_import=%d"
+            "input of %d bytes exceeds max_bytes_per_import=%d"
             % (len(raw), settings.max_bytes_per_import)
         )
     try:
@@ -604,6 +607,20 @@ def import_file(conn, path, producer, settings=None, source="fleet-tracing",
                                 "no readable spans in file; %d line(s) skipped" % unreadable_lines)
     return import_spans(conn, spans, producer, settings=settings, source=source,
                         received_at=received_at, unreadable_extra=unreadable_lines)
+
+
+def import_file(conn, path, producer, settings=None, source="fleet-tracing",
+                received_at=None):
+    """Import a file: canonical JSON, OTLP JSON, span JSON array, or JSONL.
+
+    Read at most one byte past the configured limit. Callers that need to
+    bind validation and import to the same snapshot should use import_bytes.
+    """
+    settings = settings or ImportSettings()
+    with open(path, "rb") as handle:
+        raw = handle.read(settings.max_bytes_per_import + 1)
+    return import_bytes(conn, raw, producer, settings=settings, source=source,
+                        received_at=received_at)
 
 
 # ---------------------------------------------------------------------------
