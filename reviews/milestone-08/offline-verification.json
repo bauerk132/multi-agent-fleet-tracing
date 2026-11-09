@@ -1,0 +1,51 @@
+{
+  "file": "C:\\Users\\kbaue\\Documents\\Qoder\\2026-11-09\\35e22925\\m8-node-graph-dashboard.html",
+  "browser": "156.0.8078.80",
+  "offlineBeforeNavigation": true,
+  "freshContext": true,
+  "checks": [
+    {
+      "name": "offline dark surfaces and positioned shell",
+      "passed": true
+    },
+    {
+      "name": "three spans retain parent hierarchy and proof values",
+      "passed": true
+    },
+    {
+      "name": "select root updates inspector and clears LLM attributes",
+      "passed": true
+    },
+    {
+      "name": "select tool updates duration, tool name and call ID",
+      "passed": true
+    },
+    {
+      "name": "select LLM restores model and 120/340 token inspector",
+      "passed": true
+    },
+    {
+      "name": "collapse and expand controls operate on hierarchy",
+      "passed": true
+    },
+    {
+      "name": "search preserves matching descendants and their ancestor",
+      "passed": true
+    },
+    {
+      "name": "two original findings and honest partial provenance remain",
+      "passed": true
+    },
+    {
+      "name": "desktop widths keep panes and horizontal tree scrolling usable",
+      "passed": true
+    },
+    {
+      "name": "embedded fonts and icons load without remote resources",
+      "passed": true
+    }
+  ],
+  "runtimeErrors": [],
+  "missingResources": [],
+  "networkRequests": []
+}
