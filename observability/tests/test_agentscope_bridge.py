@@ -395,8 +395,9 @@ class BridgeTests(unittest.TestCase):
     def test_multi_run_delivery_accounts_for_independent_partial_failure(self):
         spans = source_spans("a" * 32, False) + source_spans("b" * 32, False)
         raw = json.dumps(spans, sort_keys=True).encode()
-        def send(document, server, token, synthetic_only=False):
+        def send(document, server, token, synthetic_only=False, live=False):
             self.assertTrue(synthetic_only)
+            self.assertFalse(live)
             doc = json.loads(document.decode())
             if doc["run"]["native_id"] == "b" * 32:
                 raise BridgeError("synthetic readback mismatch", "readback_failed")
@@ -418,8 +419,9 @@ class BridgeTests(unittest.TestCase):
         raw = json.dumps(spans, sort_keys=True).encode()
         attempted = []
 
-        def send(document, server, token, synthetic_only=False):
+        def send(document, server, token, synthetic_only=False, live=False):
             self.assertTrue(synthetic_only)
+            self.assertFalse(live)
             trace_id = json.loads(document.decode())["run"]["native_id"]
             attempted.append(trace_id)
             if trace_id == "b" * 32:
@@ -650,7 +652,7 @@ class BridgeTests(unittest.TestCase):
                 }]}],
             }],
         }
-        source_kind, _, documents = bridge._parse_source_snapshot(
+        source_kind, _, documents, _ = bridge._parse_source_snapshot(
             json.dumps(payload).encode(), "copilot"
         )
         self.assertEqual(source_kind, "otlp")

@@ -1,0 +1,185 @@
+{
+  "findings": [
+    {
+      "detector": "slowest_span",
+      "detector_version": "1",
+      "epistemic": "observed",
+      "evidence": [
+        "ev:span:spn_941ade70f73a7189"
+      ],
+      "id": "fnd_13760b249b5ad386",
+      "kind": "slowest_span",
+      "node_name": "web-search",
+      "run_id": "run_939d2ebd75b177e3",
+      "severity": "info",
+      "summary": "Exclusive time 300.0 ms (time not covered by child spans). That is 15.0% of the run's wall-clock time of 2000.0 ms.",
+      "title": "Slowest span #2: tool.exec"
+    },
+    {
+      "detector": "slowest_span",
+      "detector_version": "1",
+      "epistemic": "observed",
+      "evidence": [
+        "ev:span:spn_742570ebc6606ada"
+      ],
+      "id": "fnd_6b0810940480493f",
+      "kind": "slowest_span",
+      "node_name": null,
+      "run_id": "run_939d2ebd75b177e3",
+      "severity": "info",
+      "summary": "Exclusive time 1000.0 ms (time not covered by child spans). That is 50.0% of the run's wall-clock time of 2000.0 ms.",
+      "title": "Slowest span #1: llm.call"
+    }
+  ],
+  "honest_label": "Observer-generated proof run, not a live Copilot trace.",
+  "import_id": "imp_875401aa964d651a",
+  "predicted_ids": {
+    "import_id": "imp_875401aa964d651a",
+    "runs": {
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "run_939d2ebd75b177e3"
+    },
+    "spans": {
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+        "1111111111111111": "spn_7dc938624bbd0ad1",
+        "2222222222222222": "spn_742570ebc6606ada",
+        "3333333333333333": "spn_941ade70f73a7189"
+      }
+    }
+  },
+  "quality": "partial",
+  "run": {
+    "capabilities": {
+      "supports_checkpoints": false,
+      "supports_cost": false,
+      "supports_graph_topology": false,
+      "supports_interrupts": false,
+      "supports_node_execution_mapping": false,
+      "supports_spans": true,
+      "supports_state_snapshots": false,
+      "supports_token_usage": true
+    },
+    "graph_mode": "tree",
+    "graph_mode_reason": "no topology in source and no node executions; 3 spans shown as a tree",
+    "id": "run_939d2ebd75b177e3",
+    "outcome": null,
+    "quality": "partial",
+    "status": "ok"
+  },
+  "run_summary": {
+    "ended_us": 1700000002000000,
+    "graph_mode": "tree",
+    "id": "run_939d2ebd75b177e3",
+    "name": null,
+    "outcome": null,
+    "started_us": 1700000000000000,
+    "status": "ok"
+  },
+  "source": "live-mode adapter + pinned AgentScope pipeline (in-process)",
+  "spans": [
+    {
+      "attributes": {
+        "agent.name": "copilot",
+        "fleet.span": "agent.run",
+        "fleet.trace": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "cost_basis": null,
+      "cost_micro_usd": null,
+      "duration_us": 2000000,
+      "ended_us": 1700000002000000,
+      "error": null,
+      "exclusive_us": 700000,
+      "finish_reason": null,
+      "id": "spn_7dc938624bbd0ad1",
+      "input_payload": null,
+      "kind": "run",
+      "model": null,
+      "name": "agent.run",
+      "native_id": "1111111111111111",
+      "node_name": null,
+      "output_payload": null,
+      "parent_id": null,
+      "seq": 0,
+      "source_ref": {
+        "pointer": "/spans/0"
+      },
+      "started_us": 1700000000000000,
+      "status": "ok",
+      "tokens_in": null,
+      "tokens_out": null,
+      "tokens_reasoning": null,
+      "tool_call_id": null,
+      "tool_name": null
+    },
+    {
+      "attributes": {
+        "fleet.span": "llm.call",
+        "fleet.trace": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "gen_ai.request.model": "gpt-5",
+        "gen_ai.usage.input_tokens": 120,
+        "gen_ai.usage.output_tokens": 340
+      },
+      "cost_basis": null,
+      "cost_micro_usd": null,
+      "duration_us": 1000000,
+      "ended_us": 1700000001500000,
+      "error": null,
+      "exclusive_us": 1000000,
+      "finish_reason": null,
+      "id": "spn_742570ebc6606ada",
+      "input_payload": null,
+      "kind": "llm",
+      "model": "gpt-5",
+      "name": "llm.call",
+      "native_id": "2222222222222222",
+      "node_name": null,
+      "output_payload": null,
+      "parent_id": "spn_7dc938624bbd0ad1",
+      "seq": 1,
+      "source_ref": {
+        "pointer": "/spans/1"
+      },
+      "started_us": 1700000000500000,
+      "status": "ok",
+      "tokens_in": 120,
+      "tokens_out": 340,
+      "tokens_reasoning": null,
+      "tool_call_id": null,
+      "tool_name": null
+    },
+    {
+      "attributes": {
+        "fleet.span": "tool.exec",
+        "fleet.trace": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "gen_ai.tool.call.id": "call-123",
+        "gen_ai.tool.name": "web-search"
+      },
+      "cost_basis": null,
+      "cost_micro_usd": null,
+      "duration_us": 300000,
+      "ended_us": 1700000001900000,
+      "error": null,
+      "exclusive_us": 300000,
+      "finish_reason": null,
+      "id": "spn_941ade70f73a7189",
+      "input_payload": null,
+      "kind": "tool",
+      "model": null,
+      "name": "tool.exec",
+      "native_id": "3333333333333333",
+      "node_name": "web-search",
+      "output_payload": null,
+      "parent_id": "spn_7dc938624bbd0ad1",
+      "seq": 2,
+      "source_ref": {
+        "pointer": "/spans/2"
+      },
+      "started_us": 1700000001600000,
+      "status": "ok",
+      "tokens_in": null,
+      "tokens_out": null,
+      "tokens_reasoning": null,
+      "tool_call_id": "call-123",
+      "tool_name": "web-search"
+    }
+  ]
+}

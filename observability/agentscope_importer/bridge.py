@@ -96,6 +96,102 @@ def _require_synthetic_only(value):
         raise BridgeError("delivery requires explicit synthetic-only acknowledgment")
 
 
+def _require_live_acknowledgment(value):
+    if value is not True:
+        raise BridgeError("delivery requires explicit live acknowledgment")
+
+
+# Copilot OTel exporter span names (observed exporter shape: invoke_agent
+# root, chat, execute_tool children; service.name copilot-chat) mapped to
+# the canonical SPAN_NAMES vocabulary. Live mode renames only these three;
+# any other non-canonical name is refused by validation (fail closed).
+COPILOT_SPAN_NAMES = {
+    "invoke_agent": "agent.run",
+    "chat": "llm.call",
+    "execute_tool": "tool.exec",
+}
+
+
+def _normalize_live_attributes(attrs, allowed=ATTRIBUTE_ALLOWLIST):
+    """Drop attribute entries whose key is outside `allowed`.
+
+    Dict-form attributes (flat spans) lose the key; list-form OTLP
+    attributes lose the entry. Returns the number of dropped entries.
+    Values are still validated by the existing allowlist checks, so an
+    allowlisted key with an unsafe value still refuses the delivery.
+    """
+    dropped = 0
+    if isinstance(attrs, dict):
+        for key in list(attrs):
+            if key not in allowed:
+                del attrs[key]
+                dropped += 1
+        return dropped
+    if isinstance(attrs, list):
+        kept = []
+        for entry in attrs:
+            if isinstance(entry, dict) and entry.get("key") in allowed:
+                kept.append(entry)
+            else:
+                dropped += 1
+        attrs[:] = kept
+        return dropped
+    return 0
+
+
+def _normalize_live_span(span):
+    """Rename one raw span to the canonical vocabulary (live mode only).
+
+    Returns (renamed, dropped_attributes). A Copilot exporter name is
+    renamed to its canonical name; any other non-canonical name is left
+    alone so validation refuses it with the existing error.
+    """
+    renamed = 0
+    name = span.get("name") if isinstance(span, dict) else None
+    if isinstance(name, str) and name in COPILOT_SPAN_NAMES:
+        span["name"] = COPILOT_SPAN_NAMES[name]
+        renamed = 1
+    dropped = 0
+    if isinstance(span, dict) and "attributes" in span:
+        dropped += _normalize_live_attributes(span["attributes"])
+    return renamed, dropped
+
+
+def _normalize_live_otlp(payload):
+    """Normalize a raw OTLP/HTTP JSON payload for live delivery.
+
+    Renames Copilot exporter span names and drops unapproved attribute
+    entries (resource, scope, and span level). Returns
+    (renamed_spans, dropped_attributes).
+    """
+    renamed = 0
+    dropped = 0
+    resource_spans = payload.get("resourceSpans")
+    if not isinstance(resource_spans, list):
+        return renamed, dropped
+    for resource_span in resource_spans:
+        if not isinstance(resource_span, dict):
+            continue
+        resource = resource_span.get("resource")
+        if isinstance(resource, dict) and "attributes" in resource:
+            dropped += _normalize_live_attributes(
+                resource["attributes"], allowed={"service.name", "service.version"}
+            )
+        for scope_span in resource_span.get("scopeSpans") or []:
+            if not isinstance(scope_span, dict):
+                continue
+            scope = scope_span.get("scope")
+            if isinstance(scope, dict) and "attributes" in scope:
+                dropped += _normalize_live_attributes(scope["attributes"])
+            for span in scope_span.get("spans") or []:
+                if not isinstance(span, dict):
+                    continue
+                count_renamed, count_dropped = _normalize_live_span(span)
+                renamed += count_renamed
+                dropped += count_dropped
+    return renamed, dropped
+
+
 def validate_server(url):
     """Require explicit plain-HTTP loopback IP and reject URL ambiguity."""
     try:
@@ -401,7 +497,18 @@ def _validate_otlp_payload(payload):
     return flattened
 
 
-def _parse_source_snapshot(raw, producer):
+def _parse_source_snapshot(raw, producer, live=False):
+    """Parse one bounded source snapshot into canonical documents.
+
+    Live mode normalizes raw Copilot exporter observations before
+    validation: Copilot OTel span names are renamed to the canonical
+    vocabulary and attribute entries outside the allowlist are dropped
+    (counted, never silent). Canonical documents are never normalized;
+    they must already be valid. Returns (kind, parsed, documents,
+    normalization) where normalization is {"renamed_spans": int,
+    "dropped_attributes": int}.
+    """
+    normalization = {"renamed_spans": 0, "dropped_attributes": 0}
     try:
         parsed = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
@@ -409,23 +516,33 @@ def _parse_source_snapshot(raw, producer):
     if isinstance(parsed, dict) and "schema_version" in parsed and "run" in parsed:
         document_bytes = canonical_bytes(parsed)
         validate_artifact(parsed, document_bytes)
-        return "canonical", parsed, [parsed]
+        return "canonical", parsed, [parsed], normalization
     if isinstance(parsed, dict) and "resourceSpans" in parsed:
+        if live:
+            renamed, dropped = _normalize_live_otlp(parsed)
+            normalization["renamed_spans"] += renamed
+            normalization["dropped_attributes"] += dropped
         spans = _validate_otlp_payload(parsed)
         mapped = map_spans(spans, producer)
         documents = [document for _, document in mapped["documents"]]
         for document in documents:
             validate_artifact(document, canonical_bytes(document))
-        return "otlp", parsed, documents
+        return "otlp", parsed, documents, normalization
     if isinstance(parsed, list):
+        if live:
+            for span in parsed:
+                if isinstance(span, dict):
+                    renamed, dropped = _normalize_live_span(span)
+                    normalization["renamed_spans"] += renamed
+                    normalization["dropped_attributes"] += dropped
         _validate_flat_spans(parsed)
         mapped = map_spans(parsed, producer)
         documents = [document for _, document in mapped["documents"]]
         for document in documents:
             validate_artifact(document, canonical_bytes(document))
-        return "spans", parsed, documents
+        return "spans", parsed, documents, normalization
     if parsed is not None:
-        return "unsupported", parsed, []
+        return "unsupported", parsed, [], normalization
 
     text = raw.decode("utf-8", errors="replace")
     spans = []
@@ -438,12 +555,18 @@ def _parse_source_snapshot(raw, producer):
             spans.append(json.loads(line))
         except ValueError:
             unreadable_lines += 1
+    if live:
+        for span in spans:
+            if isinstance(span, dict):
+                renamed, dropped = _normalize_live_span(span)
+                normalization["renamed_spans"] += renamed
+                normalization["dropped_attributes"] += dropped
     _validate_flat_spans(spans)
     mapped = map_spans(spans, producer)
     documents = [document for _, document in mapped["documents"]]
     for document in documents:
         validate_artifact(document, canonical_bytes(document))
-    return "jsonl", (spans, unreadable_lines), documents
+    return "jsonl", (spans, unreadable_lines), documents, normalization
 
 
 def _validate_canonical_document(doc, raw, max_bytes):
@@ -1041,8 +1164,15 @@ def _read_run_summary(base, run_id, token):
     raise BridgeError("run summary was not found within the readback limit", "readback_failed")
 
 
-def _deliver_document(raw, server, token, *, synthetic_only=False):
-    _require_synthetic_only(synthetic_only)
+def _deliver_document(raw, server, token, *, synthetic_only=False, live=False):
+    if live and synthetic_only:
+        raise BridgeError("live and synthetic-only acknowledgments conflict; pass exactly one")
+    if live:
+        _require_live_acknowledgment(live)
+    elif synthetic_only:
+        _require_synthetic_only(synthetic_only)
+    else:
+        raise BridgeError("delivery requires an explicit acknowledgment: --synthetic-only for test data or --live for real observations")
     parsed_server = validate_server(server)
     base = "%s://%s" % (parsed_server.scheme, parsed_server.netloc)
     doc = json.loads(raw.decode("utf-8"))
@@ -1158,13 +1288,29 @@ def _receipt_summary(receipt, documents=None):
     }
 
 
-def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synthetic_only=False):
+def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synthetic_only=False, live=False):
     """Validate, locally import, then deliver the same bounded source snapshot.
 
     Mapping and local import both consume the identical in-memory byte string;
     no later source-file read can change the artifact after validation.
+
+    Exactly one acknowledgment is required: `synthetic_only=True` for
+    synthetic test data, or `live=True` for real Copilot observations.
+    Live delivery accepts only producer "copilot" and normalizes raw
+    Copilot exporter spans (name mapping, attribute sanitizing) before
+    validation; it never passes real observations with a synthetic-only
+    acknowledgment.
     """
-    _require_synthetic_only(synthetic_only)
+    if live and synthetic_only:
+        raise BridgeError("live and synthetic-only acknowledgments conflict; pass exactly one")
+    if live:
+        if producer != "copilot":
+            raise BridgeError("live delivery accepts Copilot observations only (producer must be copilot)")
+        mode = "live"
+    elif synthetic_only:
+        mode = "synthetic"
+    else:
+        raise BridgeError("delivery requires an explicit acknowledgment: --synthetic-only for test data or --live for real observations")
     validate_server(server)
     if not isinstance(raw, bytes) or len(raw) > (settings or ImportSettings()).max_bytes_per_import:
         raise BridgeError("input snapshot exceeds the configured size limit")
@@ -1174,10 +1320,14 @@ def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synth
         raise BridgeError("AgentScope token is missing or malformed", "authentication_failed")
     settings = settings or ImportSettings()
     try:
-        source_kind, parsed, documents = _parse_source_snapshot(raw, producer)
+        source_kind, parsed, documents, normalization = _parse_source_snapshot(raw, producer, live=live)
         for document in documents:
             document_bytes = canonical_bytes(document)
             validate_artifact(document, document_bytes, settings.max_bytes_per_import)
+        if live:
+            for document in documents:
+                if document["run"]["metadata"]["producer"] != "copilot":
+                    raise BridgeError("live delivery accepts Copilot observations only (producer must be copilot)")
     except BridgeError:
         raise
     except (ValueError, TypeError, OverflowError, UnicodeError, RecursionError):
@@ -1201,6 +1351,8 @@ def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synth
         "source_snapshot_sha256": hashlib.sha256(raw).hexdigest(),
         "source_snapshot_bytes": len(raw),
         "source_format": source_kind,
+        "mode": mode,
+        "live_normalization": normalization,
         "fleet_receipt": receipt_summary,
         "run_mappings": [],
         "deliveries": [],
@@ -1239,7 +1391,7 @@ def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synth
 
     for index, (document_bytes, mapping) in enumerate(pending):
         try:
-            delivery = _deliver_document(document_bytes, server, token, synthetic_only=synthetic_only)
+            delivery = _deliver_document(document_bytes, server, token, synthetic_only=synthetic_only, live=live)
             base_result["deliveries"].append(delivery)
         except BridgeError as exc:
             base_result["failures"].append({

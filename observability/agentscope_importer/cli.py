@@ -3,7 +3,7 @@
 Usage (run from the observability/ directory):
   python -m agentscope_importer import <file> [--data-dir DIR] [--producer NAME]
   python -m agentscope_importer deliver <file> [--data-dir DIR] [--producer NAME]
-      [--server http://127.0.0.1:8765] [--synthetic-only]
+      [--server http://127.0.0.1:8765] [--synthetic-only | --live]
   python -m agentscope_importer verify [--data-dir DIR]
   python -m agentscope_importer receipt <import_id> [--data-dir DIR]
   python -m agentscope_importer purge [--data-dir DIR]
@@ -94,8 +94,11 @@ def _cmd_stats(args):
 def _cmd_deliver(args):
     from agentscope_importer.bridge import BridgeError, deliver_snapshot, snapshot_source, validate_server
 
-    if not args.synthetic_only:
-        print(json.dumps({"outcome": "rejected", "error": "delivery requires explicit synthetic-only acknowledgment (pass --synthetic-only)"}, sort_keys=True), file=sys.stderr)
+    if args.live and args.synthetic_only:
+        print(json.dumps({"outcome": "rejected", "error": "live and synthetic-only acknowledgments conflict; pass exactly one"}, sort_keys=True), file=sys.stderr)
+        return 1
+    if not args.synthetic_only and not args.live:
+        print(json.dumps({"outcome": "rejected", "error": "delivery requires an explicit acknowledgment (pass --synthetic-only for test data or --live for real observations)"}, sort_keys=True), file=sys.stderr)
         return 1
     try:
         validate_server(args.server)
@@ -106,7 +109,7 @@ def _cmd_deliver(args):
             token = getpass.getpass("AgentScope token: ")
         conn = ledger_mod.open_ledger(_ledger_path(args.deliver_data_dir or args.data_dir))
         try:
-            result = deliver_snapshot(conn, raw, args.producer, args.server, token, synthetic_only=args.synthetic_only)
+            result = deliver_snapshot(conn, raw, args.producer, args.server, token, synthetic_only=args.synthetic_only, live=args.live)
         finally:
             conn.close()
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -144,7 +147,9 @@ def main(argv=None):
     p_deliver.add_argument("--producer", default="fleet-tracing")
     p_deliver.add_argument("--server", default="http://127.0.0.1:8765")
     p_deliver.add_argument("--synthetic-only", action="store_true",
-                           help="acknowledge the snapshot is synthetic-only test data (required)")
+                           help="acknowledge the snapshot is synthetic-only test data (required unless --live)")
+    p_deliver.add_argument("--live", action="store_true",
+                           help="acknowledge the snapshot is a real Copilot observation (required unless --synthetic-only)")
     p_deliver.add_argument("--data-dir", dest="deliver_data_dir", default=None)
     p_deliver.set_defaults(func=_cmd_deliver)
 
