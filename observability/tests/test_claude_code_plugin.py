@@ -28,6 +28,7 @@ from claude_code_plugin._vocab import (  # noqa: E402
     SPAN_TYPE_TO_V1,
 )
 from claude_code_plugin import _sanitize  # noqa: E402
+from claude_code_plugin import _vocab  # noqa: E402
 from claude_code_plugin.adapter import flatten_lines  # noqa: E402
 
 
@@ -1377,6 +1378,122 @@ class Step3SanitizeTests(unittest.TestCase):
             for value in NON_STRING_INPUTS + HOSTILE_TEXT:
                 with self.subTest(helper=helper.__name__, value=repr(value)[:40]):
                     helper(value)
+
+
+# M7-B step 3 S2: attribute sources, strip lists and constants in _vocab.
+class Step3VocabTests(unittest.TestCase):
+    SESSION_TYPES = (
+        "claude_code.interaction",
+        "claude_code.llm_request",
+        "claude_code.tool",
+        "claude_code.hook",
+    )
+
+    def _rows(self):
+        for span_type, rows in _vocab.ATTRIBUTE_SOURCES.items():
+            for row in rows:
+                yield span_type, row
+
+    def test_every_output_key_is_allowed_and_not_fleet(self):
+        for span_type, (output_key, _sources, _kind) in self._rows():
+            with self.subTest(span_type=span_type, output_key=output_key):
+                self.assertIn(output_key, _vocab.OUTPUT_ATTRIBUTE_KEYS)
+                self.assertFalse(output_key.startswith("fleet."))
+                self.assertIn(output_key, bridge.ATTRIBUTE_ALLOWLIST)
+
+    def test_no_source_key_is_stripped_or_folded_input(self):
+        for span_type, (output_key, sources, _kind) in self._rows():
+            for source in sources:
+                with self.subTest(span_type=span_type, source=source):
+                    self.assertFalse(_vocab.is_stripped(source))
+                    self.assertNotIn(source, _vocab.FOLD_INPUT_KEYS)
+
+    def test_every_kind_is_known(self):
+        self.assertIsInstance(_vocab.ATTRIBUTE_KINDS, frozenset)
+        self.assertEqual(
+            _vocab.ATTRIBUTE_KINDS,
+            frozenset({"uuid", "seq", "model", "count", "tool_name", "text"}),
+        )
+        for span_type, (output_key, _sources, kind) in self._rows():
+            with self.subTest(span_type=span_type, output_key=output_key):
+                self.assertIn(kind, _vocab.ATTRIBUTE_KINDS)
+
+    def test_sources_keys_match_span_map_and_folds_are_disjoint(self):
+        self.assertEqual(set(_vocab.ATTRIBUTE_SOURCES), set(SPAN_TYPE_TO_V1))
+        self.assertIsInstance(_vocab.FOLD_TYPES, frozenset)
+        self.assertEqual(
+            _vocab.FOLD_TYPES,
+            frozenset({"claude_code.tool.execution", "claude_code.tool.blocked_on_user"}),
+        )
+        self.assertEqual(set(_vocab.FOLD_TYPES) & set(SPAN_TYPE_TO_V1), set())
+
+    def test_session_id_row_present_for_all_four_types(self):
+        for span_type in self.SESSION_TYPES:
+            with self.subTest(span_type=span_type):
+                rows = _vocab.ATTRIBUTE_SOURCES[span_type]
+                self.assertIn(
+                    ("session.id", ("session.id",), "uuid"), rows,
+                )
+
+    def test_attribute_sources_are_read_only_tuples(self):
+        self.assertIsInstance(_vocab.ATTRIBUTE_SOURCES, type(SPAN_TYPE_TO_V1))
+        with self.assertRaises(TypeError):
+            _vocab.ATTRIBUTE_SOURCES["claude_code.hook"] = ()
+        with self.assertRaises(TypeError):
+            del _vocab.ATTRIBUTE_SOURCES["claude_code.hook"]
+        for span_type, rows in _vocab.ATTRIBUTE_SOURCES.items():
+            with self.subTest(span_type=span_type):
+                self.assertIsInstance(rows, tuple)
+                for row in rows:
+                    self.assertIsInstance(row, tuple)
+                    self.assertEqual(len(row), 3)
+                    self.assertIsInstance(row[1], tuple)
+
+    def test_strip_containers_are_read_only(self):
+        self.assertIsInstance(_vocab.STRIP_KEYS, frozenset)
+        self.assertIsInstance(_vocab.STRIP_PREFIXES, tuple)
+        self.assertIsInstance(_vocab.STRIP_SUFFIXES, tuple)
+        self.assertIsInstance(_vocab.CONTENT_KEYS, frozenset)
+        self.assertFalse(hasattr(_vocab.STRIP_KEYS, "add"))
+        self.assertFalse(hasattr(_vocab.CONTENT_KEYS, "add"))
+
+    def test_strip_keys_contain_identity_and_host_keys(self):
+        required = {
+            "user.email", "user.id", "user.account_uuid", "user.account_id",
+            "organization.id", "ccr.session.id", "host.name", "host.id",
+            "terminal.type", "user_prompt",
+        }
+        self.assertEqual(required - set(_vocab.STRIP_KEYS), set())
+
+    def test_is_stripped_true_cases(self):
+        for key in (
+            "vcs.repository.url", "workflow.name", "user.anything",
+            "host.arch", "organization.name", "tool_input_truncated",
+            "user_prompt_original_length",
+        ):
+            with self.subTest(key=key):
+                self.assertIs(_vocab.is_stripped(key), True)
+
+    def test_is_stripped_false_cases(self):
+        for key in ("session.id", "input_tokens", "tool_name", None, 5):
+            with self.subTest(key=repr(key)):
+                self.assertIs(_vocab.is_stripped(key), False)
+
+    def test_content_keys_are_all_stripped(self):
+        for key in _vocab.CONTENT_KEYS:
+            with self.subTest(key=key):
+                self.assertTrue(_vocab.is_stripped(key))
+
+    def test_agent_name_observation_source_and_producer(self):
+        self.assertEqual(_vocab.AGENT_NAME, "claude-code")
+        self.assertEqual(_vocab.OBSERVATION_SOURCE, "otel-export")
+        self.assertEqual(_vocab.PRODUCER, "claude-code")
+        self.assertTrue(_sanitize.safe_text(_vocab.AGENT_NAME))
+        self.assertTrue(_sanitize.safe_text(_vocab.OBSERVATION_SOURCE))
+        self.assertIsNotNone(bridge.PRODUCER_RE.fullmatch(_vocab.PRODUCER))
+
+    def test_redacted_prompt_constant(self):
+        self.assertEqual(_vocab.REDACTED_PROMPT, "<REDACTED>")
 
 
 if __name__ == "__main__":
