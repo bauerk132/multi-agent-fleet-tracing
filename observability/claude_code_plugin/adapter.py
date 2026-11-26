@@ -234,7 +234,9 @@ def flatten_lines(lines):
     agentscope mapper reads), ``attributes`` (dict), ``resource_attributes``
     (dict, one copy per span), ``events_count`` (int: the length of the raw
     events list, or 0 when events is absent or not a list; the raw events are
-    not kept) and ``status`` (raw dict or None).
+    not kept) and ``status`` (the raw value as received, any JSON type, or
+    None when the key is absent or null; it is not checked here and is cleaned
+    by the mapping step).
 
     Times: an int (not a bool) or an ASCII digit string at most 2**64 - 1 is
     normalized to int. A missing or ``None`` time is None and not counted.
@@ -450,7 +452,7 @@ def flatten_lines(lines):
                         "attributes": span_attrs,
                         "resource_attributes": dict(resource_attrs),
                         "events_count": len(span["events"]) if isinstance(span.get("events"), list) else 0,
-                        "status": span.get("status") if isinstance(span.get("status"), dict) else None,
+                        "status": span.get("status"),
                     })
                     counters["spans"] += 1
 

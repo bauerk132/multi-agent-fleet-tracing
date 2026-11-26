@@ -1496,5 +1496,56 @@ class Step3VocabTests(unittest.TestCase):
         self.assertEqual(_vocab.REDACTED_PROMPT, "<REDACTED>")
 
 
+# S3: flatten passes the raw present "status" value through whatever its type.
+CLEAN_ONE_SPAN_COUNTERS = {
+    "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+    "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+    "stream_truncated": 0,
+}
+
+
+def _status_line(status_value=None, drop_key=False):
+    # One clean synthetic span; the "status" key is set to status_value or removed.
+    span_dict = _span()
+    if drop_key:
+        del span_dict["status"]
+    else:
+        span_dict["status"] = status_value
+    return _line([{"resource": {}, "scopeSpans": [{"spans": [span_dict]}]}])
+
+
+class RawStatusPassthroughTests(unittest.TestCase):
+    def _assert_raw_status(self, status_value):
+        spans, counters = flatten_lines([_status_line(status_value)])
+        self.assertEqual(counters, CLEAN_ONE_SPAN_COUNTERS)
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["status"], status_value)
+        self.assertIs(type(spans[0]["status"]), type(status_value))
+
+    def test_str_status_is_raw(self):
+        self._assert_raw_status("oops")
+
+    def test_list_status_is_raw(self):
+        self._assert_raw_status([])
+
+    def test_int_status_is_raw(self):
+        self._assert_raw_status(2)
+
+    def test_bool_status_is_raw(self):
+        self._assert_raw_status(True)
+
+    def test_dict_status_is_raw(self):
+        self._assert_raw_status({"code": 2, "message": "x"})
+
+    def test_null_status_is_none(self):
+        self._assert_raw_status(None)
+
+    def test_absent_status_is_none(self):
+        spans, counters = flatten_lines([_status_line(drop_key=True)])
+        self.assertEqual(counters, CLEAN_ONE_SPAN_COUNTERS)
+        self.assertEqual(len(spans), 1)
+        self.assertIsNone(spans[0]["status"])
+
+
 if __name__ == "__main__":
     unittest.main()
