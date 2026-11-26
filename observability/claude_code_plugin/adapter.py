@@ -20,6 +20,14 @@ _INT_TEXT = re.compile(r"-?[0-9]{1,19}")
 _TIME_TEXT = re.compile(r"[0-9]{1,20}")
 _UINT64_MAX = 2 ** 64 - 1
 
+# Resource bounds: overflow is counted and skipped, never raised. Read as
+# module globals at call time so tests can patch them. The first two values
+# copy agentscope_importer/contract.py (MAX_BYTES_PER_IMPORT, MAX_SPANS_PER_IMPORT)
+# by value; this module does not import them.
+MAX_LINE_BYTES = 16 * 1024 * 1024
+MAX_SPANS = 10_000
+MAX_ATTRIBUTES_PER_SPAN = 128
+
 
 def _reject_constant(name):
     # NaN, Infinity and -Infinity are not JSON: the whole line is malformed.
@@ -80,15 +88,20 @@ def _attrs_to_dict(attrs):
 
     A KeyValue item is kept only if it is a dict with a str ``key`` and a
     ``value`` that decodes under ``_decode_any_value``. Every other item is
-    dropped and counted once in ``dropped_count``. A duplicate key keeps the
-    last value. A non-list ``attrs`` yields ``({}, 0)``; the caller counts that
+    dropped and counted once in ``dropped_count``. Only the first
+    ``MAX_ATTRIBUTES_PER_SPAN`` items are decoded; each item past that adds one
+    to ``dropped_count`` and is not iterated. A duplicate key keeps the last
+    value. A non-list ``attrs`` yields ``({}, 0)``; the caller counts that
     shape as a skipped item.
     """
     out = {}
     dropped = 0
     if not isinstance(attrs, list):
         return out, 0
-    for item in attrs:
+    limit = MAX_ATTRIBUTES_PER_SPAN
+    if len(attrs) > limit:
+        dropped += len(attrs) - limit
+    for item in attrs[:limit]:
         if not isinstance(item, dict) or not isinstance(item.get("key"), str):
             dropped += 1
             continue
@@ -131,6 +144,20 @@ def _read_time(value, counters):
     return number
 
 
+def _text_oversize(text):
+    """True if the UTF-8 size of ``text`` is over ``MAX_LINE_BYTES``.
+
+    A str that cannot be encoded as UTF-8 (a lone surrogate) is treated as
+    oversize, so it is counted as malformed and never raises.
+    """
+    if len(text) > MAX_LINE_BYTES:
+        return True
+    try:
+        return len(text.encode("utf-8")) > MAX_LINE_BYTES
+    except UnicodeEncodeError:
+        return True
+
+
 def flatten_lines(lines):
     """Return ``(spans, counters)`` for the given receiver JSONL lines.
 
@@ -149,10 +176,14 @@ def flatten_lines(lines):
     Any other present value (negative, bool, float, malformed string, too
     large, list, dict) is None and counted once in ``invalid_timestamps``.
 
-    Per-item rules: ``bytes`` items are decoded as strict UTF-8 (invalid
+    Per-item rules: a ``bytes`` item over ``MAX_LINE_BYTES`` bytes is checked
+    before decoding. ``bytes`` items are decoded as strict UTF-8 (invalid
     UTF-8 is malformed). Any non-``str`` item after that (None, int, ...)
-    counts as read and malformed. Blank or whitespace-only text lines are
-    skipped and not counted. Parsing is strict JSON: ``NaN``, ``Infinity``,
+    counts as read and malformed. A ``str`` item whose UTF-8 size is over
+    ``MAX_LINE_BYTES`` is oversize. An oversize line counts as read and
+    malformed and is never passed to ``json.loads``; a line exactly at the
+    limit is accepted. Blank or whitespace-only text lines are skipped and not
+    counted. Parsing is strict JSON: ``NaN``, ``Infinity``,
     ``-Infinity`` and any float that is not finite (such as ``1e1000``) make
     the line malformed. ``json.loads`` failures (``ValueError``,
     ``TypeError``, ``RecursionError``) are malformed. A line that is not a
@@ -170,13 +201,22 @@ def flatten_lines(lines):
 
     Attribute values follow the OTLP/JSON AnyValue rules in
     ``_attrs_to_dict``. Each rejected KeyValue item adds one to
-    ``dropped_attributes``. Resource attributes are decoded once per resource
-    entry, span attributes once per span.
+    ``dropped_attributes``, and so does each item past the first
+    ``MAX_ATTRIBUTES_PER_SPAN`` in an attributes list (resource or span).
+    Resource attributes are decoded once per resource entry, span attributes
+    once per span.
+
+    Resource bounds (count and skip, never raise): a line over
+    ``MAX_LINE_BYTES`` is malformed (see above). Across the whole stream, only
+    the first ``MAX_SPANS`` spans are kept; each later span is skipped and
+    counted in ``spans_over_limit``, not in ``skipped_items``. The span cap is
+    checked right after the span-is-a-dict check.
 
     Counters are numbers only, never line contents: ``lines_read``
-    (non-blank lines seen), ``malformed_lines``, ``spans``, ``skipped_items``,
-    ``dropped_attributes`` (the sum of all dropped attribute items) and
-    ``invalid_timestamps`` (present span time values that were rejected). No
+    (non-blank lines seen, oversize lines included), ``malformed_lines``,
+    ``spans``, ``skipped_items``, ``dropped_attributes`` (the sum of all
+    dropped attribute items), ``invalid_timestamps`` (present span time values
+    that were rejected) and ``spans_over_limit`` (spans skipped by the cap). No
     BOM handling happens here (a later step).
     """
     if isinstance(lines, (str, bytes)):
@@ -186,10 +226,15 @@ def flatten_lines(lines):
     counters = {
         "lines_read": 0, "malformed_lines": 0, "spans": 0,
         "skipped_items": 0, "dropped_attributes": 0, "invalid_timestamps": 0,
+        "spans_over_limit": 0,
     }
 
     for raw in lines:
         if isinstance(raw, bytes):
+            if len(raw) > MAX_LINE_BYTES:
+                counters["lines_read"] += 1
+                counters["malformed_lines"] += 1
+                continue
             try:
                 raw = raw.decode("utf-8")
             except UnicodeDecodeError:
@@ -197,6 +242,10 @@ def flatten_lines(lines):
                 counters["malformed_lines"] += 1
                 continue
         if not isinstance(raw, str):
+            counters["lines_read"] += 1
+            counters["malformed_lines"] += 1
+            continue
+        if _text_oversize(raw):
             counters["lines_read"] += 1
             counters["malformed_lines"] += 1
             continue
@@ -246,6 +295,9 @@ def flatten_lines(lines):
                 for span in span_list:
                     if not isinstance(span, dict):
                         counters["skipped_items"] += 1
+                        continue
+                    if counters["spans"] >= MAX_SPANS:
+                        counters["spans_over_limit"] += 1
                         continue
                     identity = (
                         span.get("name"), span.get("traceId"),
