@@ -138,6 +138,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 5, "malformed_lines": 3, "spans": 2, "skipped_items": 0,
             "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         self.assertEqual(len(spans), 2)
         self.assertEqual(spans[0]["name"], "claude_code.interaction")
@@ -162,6 +163,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
                 self.assertEqual(counters, {
                     "lines_read": 2, "malformed_lines": 0, "spans": 2, "skipped_items": 1,
                     "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+                    "stream_truncated": 0,
                 })
                 self.assertEqual(spans[0]["resource_attributes"], {})
                 self.assertEqual(spans[1]["resource_attributes"]["service.name"], "claude-code")
@@ -178,6 +180,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 5, "malformed_lines": 0, "spans": 1, "skipped_items": 4,
             "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         self.assertEqual(len(spans), 1)
 
@@ -188,6 +191,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 2, "malformed_lines": 0, "spans": 1, "skipped_items": 3,
             "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         self.assertEqual(len(spans), 1)
 
@@ -212,6 +216,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 4,
             "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         self.assertEqual(len(spans), 1)
         for span in spans:
@@ -225,6 +230,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 3, "malformed_lines": 1, "spans": 2, "skipped_items": 0,
             "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         self.assertEqual(len(spans), 2)
 
@@ -234,6 +240,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 4, "malformed_lines": 2, "spans": 2, "skipped_items": 0,
             "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         self.assertEqual(len(spans), 2)
 
@@ -247,6 +254,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 3, "malformed_lines": 1, "spans": 2, "skipped_items": 0,
             "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         self.assertEqual(len(spans), 2)
 
@@ -265,6 +273,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 6, "malformed_lines": 4, "spans": 2, "skipped_items": 0,
             "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         self.assertEqual(len(spans), 2)
 
@@ -314,6 +323,7 @@ class StrictAnyValueTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
             "dropped_attributes": 12, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         self.assertEqual(spans[0]["attributes"], {
             "a.str": "ok",
@@ -342,6 +352,7 @@ class StrictAnyValueTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 1, "malformed_lines": 0, "spans": 3, "skipped_items": 3,
             "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         self.assertEqual(len(spans), 3)
         for span in spans:
@@ -361,6 +372,7 @@ class StrictAnyValueTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 1, "malformed_lines": 0, "spans": 2, "skipped_items": 0,
             "dropped_attributes": 1, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         self.assertEqual(spans[0]["resource_attributes"], {"service.name": "claude-code"})
 
@@ -425,6 +437,7 @@ class FlattenTimestampTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 1, "malformed_lines": 0, "spans": 12, "skipped_items": 0,
             "dropped_attributes": 0, "invalid_timestamps": 8, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         by_id = {span["spanId"]: span for span in spans}
         for index in range(len(bad_values)):
@@ -510,6 +523,7 @@ class ResourceLimitTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 6, "malformed_lines": 3, "spans": 3, "skipped_items": 0,
             "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
         })
         self.assertEqual(len(spans), 3)
         self.assertEqual({span["name"] for span in spans}, {"claude_code.interaction"})
@@ -525,6 +539,7 @@ class ResourceLimitTests(unittest.TestCase):
         self.assertEqual(counters, {
             "lines_read": 2, "malformed_lines": 0, "spans": 3, "skipped_items": 0,
             "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 4,
+            "stream_truncated": 0,
         })
         self.assertEqual(len(spans), 3)
 
@@ -539,6 +554,7 @@ class ResourceLimitTests(unittest.TestCase):
             self.assertEqual(counters, {
                 "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
                 "dropped_attributes": 6, "invalid_timestamps": 0, "spans_over_limit": 0,
+                "stream_truncated": 0,
             })
 
             resource_attrs = [_kv("r%d" % i, {"stringValue": "v"}) for i in range(6)]
@@ -550,6 +566,7 @@ class ResourceLimitTests(unittest.TestCase):
             self.assertEqual(counters, {
                 "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
                 "dropped_attributes": 2, "invalid_timestamps": 0, "spans_over_limit": 0,
+                "stream_truncated": 0,
             })
 
 
@@ -607,6 +624,93 @@ class ResourceCopyAndEventRecordTests(unittest.TestCase):
         for record in spans:
             self.assertEqual(record["events_count"], 0)
             self.assertNotIn("events", record)
+
+
+class StreamBudgetTests(unittest.TestCase):
+    def test_stream_budget_stops_and_flags(self):
+        # Budget for 3 good lines: the 4th item overflows and stops the stream.
+        # Items 5 and 6 are never pulled. Same result for str and bytes items.
+        line = _good_line()
+        size = len(line.encode("utf-8"))
+        for kind in ("str", "bytes"):
+            with self.subTest(kind=kind):
+                pulled = []
+
+                def source():
+                    for _ in range(6):
+                        pulled.append(1)
+                        yield line if kind == "str" else line.encode("utf-8")
+
+                with mock.patch.object(adapter_module, "MAX_TOTAL_BYTES", 3 * size):
+                    spans, counters = flatten_lines(source())
+                self.assertEqual(len(spans), 3)
+                self.assertEqual(counters, {
+                    "lines_read": 3, "malformed_lines": 0, "spans": 3, "skipped_items": 0,
+                    "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+                    "stream_truncated": 1,
+                })
+                self.assertEqual(len(pulled), 4)
+
+    def test_stream_budget_exact_boundary_accepted(self):
+        # A total exactly equal to the budget is accepted; nothing is flagged.
+        line = _good_line()
+        size = len(line.encode("utf-8"))
+        with mock.patch.object(adapter_module, "MAX_TOTAL_BYTES", 3 * size):
+            spans, counters = flatten_lines([line, line, line])
+        self.assertEqual(len(spans), 3)
+        self.assertEqual(counters, {
+            "lines_read": 3, "malformed_lines": 0, "spans": 3, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+
+    def test_stream_budget_charges_blank_and_malformed(self):
+        # A blank item is charged too. Budget size+1: "\n" (1 byte) fits, then
+        # the second good line overflows and is never parsed.
+        line = _good_line()
+        size = len(line.encode("utf-8"))
+        with mock.patch.object(adapter_module, "MAX_TOTAL_BYTES", size + 1):
+            spans, counters = flatten_lines([line, "\n", line])
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 1,
+        })
+        # A 4-byte blank line is charged: with budget 2*size it pushes the
+        # second good line over. Uncharged, both good lines would fit.
+        with mock.patch.object(adapter_module, "MAX_TOTAL_BYTES", 2 * size):
+            spans, counters = flatten_lines([line, "   \n", line])
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(counters["stream_truncated"], 1)
+
+    def test_stream_budget_charges_non_text_items(self):
+        # Each non-text item is charged the minimum of 1 byte, so an endless
+        # stream of them still ends. Budget 3: three counted, then stop.
+        with mock.patch.object(adapter_module, "MAX_TOTAL_BYTES", 3):
+            spans, counters = flatten_lines([None] * 5)
+        self.assertEqual(spans, [])
+        self.assertEqual(counters, {
+            "lines_read": 3, "malformed_lines": 3, "spans": 0, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 1,
+        })
+
+    def test_lone_surrogate_str_sizes_without_raising(self):
+        # A str with a lone surrogate cannot be encoded as strict UTF-8. Sizing
+        # must not raise: the line is malformed and the stream keeps going.
+        spans, counters = flatten_lines(["\ud800", _good_line()])
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(counters, {
+            "lines_read": 2, "malformed_lines": 1, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+
+    def test_stream_budget_default_matches_contract(self):
+        from agentscope_importer import contract
+        self.assertEqual(adapter_module.MAX_TOTAL_BYTES, 16 * 1024 * 1024)
+        self.assertEqual(adapter_module.MAX_TOTAL_BYTES, contract.MAX_BYTES_PER_IMPORT)
 
 
 if __name__ == "__main__":

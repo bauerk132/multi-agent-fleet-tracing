@@ -21,10 +21,14 @@ _TIME_TEXT = re.compile(r"[0-9]{1,20}")
 _UINT64_MAX = 2 ** 64 - 1
 
 # Resource bounds: overflow is counted and skipped, never raised. Read as
-# module globals at call time so tests can patch them. The first two values
-# copy agentscope_importer/contract.py (MAX_BYTES_PER_IMPORT, MAX_SPANS_PER_IMPORT)
-# by value; this module does not import them.
+# module globals at call time so tests can patch them. MAX_LINE_BYTES and
+# MAX_TOTAL_BYTES copy agentscope_importer/contract.py MAX_BYTES_PER_IMPORT, and
+# MAX_SPANS copies MAX_SPANS_PER_IMPORT, all by value; this module does not
+# import them.
 MAX_LINE_BYTES = 16 * 1024 * 1024
+# Stream-level byte budget. Every item is charged against it; the first item
+# that would overflow stops the stream.
+MAX_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_SPANS = 10_000
 MAX_ATTRIBUTES_PER_SPAN = 128
 
@@ -158,6 +162,18 @@ def _text_oversize(text):
         return True
 
 
+def _utf8_size(text):
+    """UTF-8 byte size of a str for budget charging. Never raises.
+
+    A lone surrogate cannot be encoded as strict UTF-8, so it is sized with
+    ``surrogatepass``. The line itself is still malformed (see ``_text_oversize``).
+    """
+    try:
+        return len(text.encode("utf-8"))
+    except UnicodeEncodeError:
+        return len(text.encode("utf-8", "surrogatepass"))
+
+
 def flatten_lines(lines):
     """Return ``(spans, counters)`` for the given receiver JSONL lines.
 
@@ -176,6 +192,18 @@ def flatten_lines(lines):
     normalized to int. A missing or ``None`` time is None and not counted.
     Any other present value (negative, bool, float, malformed string, too
     large, list, dict) is None and counted once in ``invalid_timestamps``.
+
+    Stream budget: every item is charged against ``MAX_TOTAL_BYTES`` before
+    anything else is done with it. A ``bytes`` item costs its length, a ``str``
+    item its UTF-8 size (a lone surrogate is sized with surrogatepass and stays
+    malformed), and any other item costs 0. Each item costs at least 1 byte.
+    When the next item would take the total past ``MAX_TOTAL_BYTES``, reading
+    stops at once: that item is not counted in ``lines_read``, not decoded and
+    not parsed, the rest of the iterable is left unread and not closed, and
+    ``stream_truncated`` is set to 1. A total exactly equal to the budget is
+    accepted. Blank, oversize, malformed, BOM and non-text items are all
+    charged. At default values a single line over 16 MiB therefore stops the
+    stream instead of being counted malformed.
 
     Per-item rules: a ``bytes`` item over ``MAX_LINE_BYTES`` bytes is checked
     before decoding. ``bytes`` items are decoded as strict UTF-8 (invalid
@@ -217,7 +245,8 @@ def flatten_lines(lines):
     (non-blank lines seen, oversize lines included), ``malformed_lines``,
     ``spans``, ``skipped_items``, ``dropped_attributes`` (the sum of all
     dropped attribute items), ``invalid_timestamps`` (present span time values
-    that were rejected) and ``spans_over_limit`` (spans skipped by the cap).
+    that were rejected), ``spans_over_limit`` (spans skipped by the cap) and
+    ``stream_truncated`` (1 if the stream budget stopped reading, else 0).
 
     BOM: after the size check (and after bytes are decoded), exactly one
     leading U+FEFF character is removed before the line is stripped and parsed. So a
@@ -233,10 +262,28 @@ def flatten_lines(lines):
     counters = {
         "lines_read": 0, "malformed_lines": 0, "spans": 0,
         "skipped_items": 0, "dropped_attributes": 0, "invalid_timestamps": 0,
-        "spans_over_limit": 0,
+        "spans_over_limit": 0, "stream_truncated": 0,
     }
+    total_limit = MAX_TOTAL_BYTES
+    used = 0
 
     for raw in lines:
+        # Stream budget first: every item is charged, at least 1 byte, so an
+        # endless stream of empty or non-text items still ends.
+        if isinstance(raw, bytes):
+            size = len(raw)
+        elif isinstance(raw, str):
+            # UTF-8 bytes are never fewer than chars, so a str longer than the
+            # remaining budget is over without encoding it.
+            size = len(raw) if len(raw) > total_limit - used else _utf8_size(raw)
+        else:
+            size = 0
+        size = max(size, 1)
+        if used + size > total_limit:
+            counters["stream_truncated"] = 1
+            break
+        used += size
+
         if isinstance(raw, bytes):
             if len(raw) > MAX_LINE_BYTES:
                 counters["lines_read"] += 1
@@ -248,11 +295,12 @@ def flatten_lines(lines):
                 counters["lines_read"] += 1
                 counters["malformed_lines"] += 1
                 continue
-        if not isinstance(raw, str):
-            counters["lines_read"] += 1
-            counters["malformed_lines"] += 1
-            continue
-        if _text_oversize(raw):
+        elif isinstance(raw, str):
+            if _text_oversize(raw):
+                counters["lines_read"] += 1
+                counters["malformed_lines"] += 1
+                continue
+        else:
             counters["lines_read"] += 1
             counters["malformed_lines"] += 1
             continue
