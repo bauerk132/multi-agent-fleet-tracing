@@ -55,7 +55,9 @@ def flatten_lines(lines):
     in ``skipped_items``, and the rest of the line keeps flattening. This
     covers a non-dict ``resourceSpans`` entry, a non-dict ``resource`` (its
     scopeSpans still flatten with empty resource attributes), a non-list
-    ``scopeSpans`` or ``spans``, and a non-dict scope or span entry.
+    ``scopeSpans`` or ``spans``, and a non-dict scope or span entry. A span whose
+    ``name``, ``traceId``, ``spanId`` or ``parentSpanId`` is present and not a
+    ``str`` (``None`` or absent is fine) is skipped and counted once.
 
     Counters are numbers only, never line contents: ``lines_read``
     (non-blank lines seen), ``malformed_lines``, ``spans`` and
@@ -122,6 +124,13 @@ def flatten_lines(lines):
                     continue
                 for span in span_list:
                     if not isinstance(span, dict):
+                        counters["skipped_items"] += 1
+                        continue
+                    identity = (
+                        span.get("name"), span.get("traceId"),
+                        span.get("spanId"), span.get("parentSpanId"),
+                    )
+                    if any(value is not None and not isinstance(value, str) for value in identity):
                         counters["skipped_items"] += 1
                         continue
                     spans.append({

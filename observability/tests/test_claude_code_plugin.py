@@ -151,6 +151,32 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         })
         self.assertEqual(len(spans), 1)
 
+    def test_non_string_identity_skips_span(self):
+        # name, traceId, spanId and parentSpanId must be str or None. Any other
+        # type skips that span (counted once); the valid span still flattens.
+        bad_name = _span()
+        bad_name["name"] = {"x": 1}
+        bad_span_id = _span()
+        bad_span_id["spanId"] = 7
+        bad_trace_id = _span()
+        bad_trace_id["traceId"] = ["a" * 32]
+        bad_parent = _span()
+        bad_parent["parentSpanId"] = True
+        valid = _span()
+        del valid["parentSpanId"]
+        line = _line([{
+            "resource": {},
+            "scopeSpans": [{"spans": [bad_name, bad_span_id, bad_trace_id, bad_parent, valid]}],
+        }])
+        spans, counters = flatten_lines([line])
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 4,
+        })
+        self.assertEqual(len(spans), 1)
+        for span in spans:
+            # Must not raise: names reaching the vocab lookup are hashable.
+            SPAN_TYPE_TO_V1.get(span["name"])
+
     def test_deeply_nested_line_is_malformed(self):
         # ~5000 levels of nesting raises RecursionError in json.loads: malformed.
         deep = "[" * 5000 + "]" * 5000
