@@ -837,6 +837,60 @@ class LoneSurrogateTests(unittest.TestCase):
         self.assertEqual(spans[1]["name"], literal)
 
 
+def _good_with_extra_key(extra_member):
+    """A valid resourceSpans line with one more top-level member appended as text."""
+    base = _good_line()
+    assert base.endswith("}")
+    return base[:-1] + ", " + extra_member + "}"
+
+
+class SurrogateWalkTests(unittest.TestCase):
+    # The surrogate check walks the decoded keys and strings. It never
+    # re-serializes the payload, so json.dumps must not run on the line path.
+
+    def test_no_json_dumps_used(self):
+        # Build every input before patching json.dumps, because the patch also
+        # affects this test's own json.dumps calls.
+        ok_line = _surrogate_line("attribute stringValue", "\U0001F600")
+        bad_line = _surrogate_line("attribute stringValue", "\ud800")
+        self.assertRegex(ok_line, r"\\ud83d\\ude00")
+        self.assertRegex(bad_line, r"\\ud800")
+        for kind in ("str", "bytes"):
+            ok_item = ok_line if kind == "str" else ok_line.encode("utf-8")
+            bad_item = bad_line if kind == "str" else bad_line.encode("utf-8")
+            with self.subTest(kind=kind):
+                with mock.patch.object(
+                    adapter_module.json, "dumps",
+                    side_effect=AssertionError("json.dumps must not be called"),
+                ):
+                    spans, counters = flatten_lines([ok_item])
+                    bad_spans, bad_counters = flatten_lines([bad_item])
+                self.assertEqual(len(spans), 1)
+                self.assertEqual(counters["malformed_lines"], 0)
+                self.assertEqual(len(bad_spans), 0)
+                self.assertEqual(bad_counters["malformed_lines"], 1)
+
+    def test_lone_surrogate_in_object_key_rejected(self):
+        line = _good_with_extra_key('"\\udc00": 1')
+        self.assertIn("\\udc00", line)
+        spans, counters = flatten_lines([line])
+        self.assertEqual(counters["malformed_lines"], 1)
+        self.assertEqual(len(spans), 0)
+
+    def test_deep_nesting_walk(self):
+        depth = 2000
+        nest_lone = "[" * depth + '"\\ud800"' + "]" * depth
+        nest_pair = "[" * depth + '"\\ud83d\\ude00"' + "]" * depth
+        lone_line = _good_with_extra_key('"pad": ' + nest_lone)
+        pair_line = _good_with_extra_key('"pad": ' + nest_pair)
+        spans, counters = flatten_lines([lone_line])
+        self.assertEqual(counters["malformed_lines"], 1)
+        self.assertEqual(len(spans), 0)
+        spans, counters = flatten_lines([pair_line])
+        self.assertEqual(counters["malformed_lines"], 0)
+        self.assertEqual(len(spans), 1)
+
+
 class AttributeDedupAndCapTests(unittest.TestCase):
     # Duplicate keys: first valid value wins, later duplicates are dropped and
     # counted. The cap counts only kept keys and applies after decoding.

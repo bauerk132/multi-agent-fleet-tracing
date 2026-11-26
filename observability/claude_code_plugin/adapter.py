@@ -21,6 +21,7 @@ _TIME_TEXT = re.compile(r"[0-9]{1,20}")
 _UINT64_MAX = 2 ** 64 - 1
 # Any JSON escape for a UTF-16 surrogate code unit (D800 to DFFF, either case).
 _SURROGATE_ESCAPE = re.compile(r"\\u[dD][89a-fA-F]")
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
 # Resource bounds: overflow is counted and skipped, never raised. Read as
 # module globals at call time so tests can patch them. MAX_LINE_BYTES and
@@ -180,16 +181,31 @@ def _has_lone_surrogate(text, payload):
 
     Raw surrogates are rejected before parsing, so one can only come from a
     JSON escape. The fast path returns False when the text has no surrogate
-    escape. Otherwise the payload is re-serialized and encoded: a correctly
-    paired escape (an emoji) passes, and a literal backslash followed by
-    ``ud800`` is a false positive of the regex that also passes here.
+    escape. Otherwise the decoded keys and strings are walked iteratively.
+    json.loads already joins a correctly paired escape into one astral
+    character, so any code point in U+D800..U+DFFF left in a decoded string is
+    a lone surrogate. A literal backslash followed by ``ud800`` decodes to
+    ASCII text and is not flagged. The payload is never re-serialized or
+    encoded.
     """
     if _SURROGATE_ESCAPE.search(text) is None:
         return False
-    try:
-        json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    except (UnicodeEncodeError, RecursionError, ValueError):
-        return True
+    sentinel = object()
+    stack = [iter((payload,))]
+    while stack:
+        item = next(stack[-1], sentinel)
+        if item is sentinel:
+            stack.pop()
+        elif isinstance(item, str):
+            if not item.isascii() and _LONE_SURROGATE.search(item):
+                return True
+        elif isinstance(item, dict):
+            for key in item:
+                if not key.isascii() and _LONE_SURROGATE.search(key):
+                    return True
+            stack.append(iter(item.values()))
+        elif isinstance(item, list):
+            stack.append(iter(item))
     return False
 
 
@@ -300,7 +316,8 @@ def flatten_lines(lines):
     surrogate appears (span fields, attributes, status, scope or resource), and
     no spans from it are kept. Correctly paired escapes (an emoji written as two
     escapes) are accepted. The check runs only on lines that contain a surrogate
-    escape, so ordinary lines are not re-encoded.
+    escape, and it walks the decoded keys and strings without re-serializing or
+    encoding the payload.
     """
     if isinstance(lines, (str, bytes, bytearray, memoryview)):
         raise TypeError(
