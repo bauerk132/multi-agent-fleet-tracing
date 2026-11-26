@@ -1547,5 +1547,337 @@ class RawStatusPassthroughTests(unittest.TestCase):
         self.assertIsNone(spans[0]["status"])
 
 
+S4_TRACE = "0" * 31 + "1"
+S4_SPAN_1 = "0" * 15 + "1"
+S4_LLM_ERROR_MSG = "LLM call failed; details withheld"
+S4_TOOL_ERROR_MSG = "Tool failed; details withheld"
+S4_OTHER_ERROR_MSG = "Error; details withheld"
+S4_MARKER_MESSAGE = "failed C:\\Users\\synth token=SYNTH_SECRET_0001"
+S4_ALLOWED_OUTPUT_KEYS = frozenset({
+    "traceId", "spanId", "parentSpanId", "name", "startTimeUnixNano",
+    "endTimeUnixNano", "attributes", "status",
+})
+S4_FORBIDDEN_OUTPUT_KEYS = frozenset({
+    "resource", "events", "scope", "kind", "resource_attributes", "events_count",
+})
+
+
+def _sid(number):
+    return format(number, "016x")
+
+
+def _rec(name="claude_code.llm_request", span_id=S4_SPAN_1, trace_id=S4_TRACE,
+         parent=None, status=None, attributes=None, events_count=0):
+    # A flatten_lines-shaped span record (see adapter.flatten_lines docstring).
+    return {
+        "name": name,
+        "traceId": trace_id,
+        "spanId": span_id,
+        "parentSpanId": parent,
+        "startTimeUnixNano": 1000,
+        "endTimeUnixNano": 2000,
+        "attributes": dict(attributes or {}),
+        "resource_attributes": {"service.name": "claude-code"},
+        "events_count": events_count,
+        "status": status,
+    }
+
+
+def _map_spans(records):
+    from claude_code_plugin import mapping
+    return mapping.map_spans(records)
+
+
+class Step3MapSpansCoreTests(unittest.TestCase):
+    """M7-B step 3 S4: mapping core (routing, ids, duplicates, projection, status)."""
+
+    def test_four_documented_types_map_to_v1_names(self):
+        records = [
+            _rec("claude_code.interaction", _sid(1)),
+            _rec("claude_code.llm_request", _sid(2)),
+            _rec("claude_code.tool", _sid(3)),
+            _rec("claude_code.hook", _sid(4)),
+        ]
+        spans, counters = _map_spans(records)
+        self.assertEqual([s["name"] for s in spans], ["agent.run", "llm.call", "tool.exec", "hook.exec"])
+        self.assertEqual(counters["spans_in"], 4)
+        self.assertEqual(counters["spans_out"], 4)
+        self.assertEqual(counters["unknown_span_types"], 0)
+
+    def test_unknown_and_fold_names_are_dropped_and_counted(self):
+        dropped_names = [
+            "agent.run",
+            "claude_code.tool.execution",
+            "claude_code.tool.blocked_on_user",
+            "foo",
+            "claude_code.Tool",
+            "claude_code.tool ",
+            "",
+            None,
+            5,
+            ["claude_code.tool"],
+        ]
+        records = [_rec(name, _sid(i + 1)) for i, name in enumerate(dropped_names)]
+        spans, counters = _map_spans(records)
+        self.assertEqual(spans, [])
+        self.assertEqual(counters["spans_in"], len(dropped_names))
+        self.assertEqual(counters["spans_out"], 0)
+        self.assertEqual(counters["unknown_span_types"], len(dropped_names))
+
+    def test_span_type_attribute_is_ignored_routing_uses_name(self):
+        spoof = _rec("claude_code.tool", _sid(1), attributes={"span.type": "agent.run"})
+        reverse = _rec("agent.run", _sid(2), attributes={"span.type": "claude_code.tool"})
+        spans, counters = _map_spans([spoof, reverse])
+        self.assertEqual([s["name"] for s in spans], ["tool.exec"])
+        self.assertEqual(counters["unknown_span_types"], 1)
+
+    def test_bad_identities_drop_the_span_and_count_invalid_ids(self):
+        records = [
+            _rec(trace_id="0" * 31),                          # 31 hex trace
+            _rec(trace_id="g" * 32),                          # non-hex trace
+            _rec(trace_id="SYNTH_SECRET_0001"),               # marker string
+            _rec(span_id="0" * 15),                           # 15 hex span
+            _rec(parent="0" * 15),                            # 15 hex parent
+            _rec(parent="0" * 17),                            # 17 hex parent
+            _rec(parent=5),                                   # non-str parent
+            "not a dict",                                     # non-dict record
+        ]
+        spans, counters = _map_spans(records)
+        self.assertEqual(spans, [])
+        self.assertEqual(counters["invalid_ids"], 8)
+        self.assertEqual(counters["spans_in"], 8)
+        self.assertNotIn("SYNTH_SECRET_0001", repr(counters))
+
+    def test_empty_and_none_parent_are_roots_and_omitted(self):
+        records = [_rec(parent=None, span_id=_sid(1)), _rec(parent="", span_id=_sid(2))]
+        spans, counters = _map_spans(records)
+        self.assertEqual(counters["invalid_ids"], 0)
+        self.assertEqual(len(spans), 2)
+        for span in spans:
+            self.assertNotIn("parentSpanId", span)
+
+    def test_valid_parent_is_kept(self):
+        spans, _ = _map_spans([_rec(parent=_sid(9), span_id=_sid(1))])
+        self.assertEqual(spans[0]["parentSpanId"], _sid(9))
+
+    def test_duplicate_span_first_wins(self):
+        first = _rec("claude_code.llm_request", _sid(1))
+        second = _rec("claude_code.tool", _sid(1))
+        spans, counters = _map_spans([first, second])
+        self.assertEqual([s["name"] for s in spans], ["llm.call"])
+        self.assertEqual(counters["duplicate_spans"], 1)
+        self.assertEqual(counters["spans_out"], 1)
+
+    def test_same_span_id_in_two_traces_are_both_kept(self):
+        other_trace = "0" * 30 + "02"
+        spans, counters = _map_spans([
+            _rec(span_id=_sid(1), trace_id=S4_TRACE),
+            _rec(span_id=_sid(1), trace_id=other_trace),
+        ])
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(counters["duplicate_spans"], 0)
+
+    def test_output_keys_are_the_projection_only(self):
+        record = _rec(
+            "claude_code.tool", _sid(1), parent=_sid(2),
+            status={"code": 2, "message": S4_MARKER_MESSAGE},
+            attributes={"tool_name": "Read", "span.type": "x"},
+            events_count=3,
+        )
+        spans, _ = _map_spans([record])
+        self.assertEqual(len(spans), 1)
+        keys = set(spans[0])
+        self.assertTrue(keys <= S4_ALLOWED_OUTPUT_KEYS, keys)
+        self.assertFalse(keys & S4_FORBIDDEN_OUTPUT_KEYS, keys)
+        self.assertEqual(spans[0]["startTimeUnixNano"], 1000)
+        self.assertEqual(spans[0]["endTimeUnixNano"], 2000)
+
+    def test_missing_times_are_omitted(self):
+        record = _rec(span_id=_sid(1))
+        record["startTimeUnixNano"] = None
+        record["endTimeUnixNano"] = None
+        spans, _ = _map_spans([record])
+        self.assertNotIn("startTimeUnixNano", spans[0])
+        self.assertNotIn("endTimeUnixNano", spans[0])
+
+    def test_constant_attributes_on_every_span(self):
+        spans, _ = _map_spans([_rec(span_id=_sid(1)), _rec("claude_code.hook", _sid(2))])
+        for span in spans:
+            self.assertEqual(span["attributes"], {"agent.name": "claude-code", "observation.source": "otel-export"})
+
+    def test_ok_and_unknown_status(self):
+        records = [
+            _rec(span_id=_sid(1), status={"code": 1}),
+            _rec(span_id=_sid(2), status={"code": 0}),
+            _rec(span_id=_sid(3), status={}),
+            _rec(span_id=_sid(4), status={"code": None}),
+            _rec(span_id=_sid(5), status=None),
+        ]
+        spans, counters = _map_spans(records)
+        self.assertEqual([s["status"] for s in spans], ["ok", "unknown", "unknown", "unknown", "unknown"])
+        self.assertEqual(counters["invalid_status"], 0)
+
+    def test_error_status_uses_safe_message_only(self):
+        cases = [
+            ("claude_code.llm_request", S4_LLM_ERROR_MSG, "LLMError"),
+            ("claude_code.tool", S4_TOOL_ERROR_MSG, "ToolError"),
+            ("claude_code.hook", S4_OTHER_ERROR_MSG, "Unknown"),
+        ]
+        for index, (name, message, error_type) in enumerate(cases):
+            record = _rec(name, _sid(index + 1), status={"code": 2, "message": S4_MARKER_MESSAGE})
+            spans, _ = _map_spans([record])
+            self.assertEqual(spans[0]["status"], {"code": 2, "message": message})
+            self.assertEqual(spans[0]["attributes"]["error.type"], error_type)
+
+    def test_marker_from_status_message_never_reaches_output_or_counters(self):
+        records = [
+            _rec("claude_code.tool", _sid(1), status={"code": 2, "message": S4_MARKER_MESSAGE}),
+            _rec("claude_code.tool", _sid(2), status={"code": 2, "message": S4_MARKER_MESSAGE, "extra": "SYNTH_SECRET_0001"}),
+        ]
+        spans, counters = _map_spans(records)
+        self.assertEqual(len(spans), 2)
+        self.assertNotIn("SYNTH_SECRET_0001", json.dumps(spans, ensure_ascii=True))
+        self.assertNotIn("SYNTH_SECRET_0001", json.dumps(counters, ensure_ascii=True))
+        self.assertNotIn("SYNTH_SECRET_0001", repr(counters))
+
+    def test_invalid_status_codes_and_shapes_count_invalid_status(self):
+        invalid_statuses = [
+            {"code": True},
+            {"code": "2"},
+            {"code": 7},
+            {"code": 2.0},
+            "oops",
+            [],
+        ]
+        records = [_rec(span_id=_sid(i + 1), status=value) for i, value in enumerate(invalid_statuses)]
+        spans, counters = _map_spans(records)
+        self.assertEqual(len(spans), len(invalid_statuses))
+        self.assertEqual(counters["invalid_status"], len(invalid_statuses))
+        for span in spans:
+            self.assertEqual(span["status"], "unknown")
+            self.assertNotIn("error.type", span["attributes"])
+
+    def test_success_true_false_rule_for_llm_and_tool(self):
+        records = [
+            _rec("claude_code.llm_request", _sid(1), attributes={"success": True}),          # ok
+            _rec("claude_code.llm_request", _sid(2), attributes={"success": False}),         # error
+            _rec("claude_code.llm_request", _sid(3), status={"code": 1},
+                 attributes={"success": False}),                                              # error
+            _rec("claude_code.llm_request", _sid(4), status={"code": 0},
+                 attributes={"success": True}),                                               # ok
+            _rec("claude_code.tool", _sid(5), attributes={"success": False}),                 # error
+            _rec("claude_code.tool", _sid(6), attributes={"success": True}),                  # ok
+            _rec("claude_code.llm_request", _sid(7), status={"code": 2},
+                 attributes={"success": True}),                                               # error, code wins
+            _rec("claude_code.llm_request", _sid(8), status={"code": 7},
+                 attributes={"success": True}),                                               # invalid, then ok
+            _rec("claude_code.interaction", _sid(9), attributes={"success": False}),         # no rule: unknown
+        ]
+        spans, counters = _map_spans(records)
+        statuses = [s["status"] for s in spans]
+        self.assertEqual(statuses[0], "ok")
+        self.assertEqual(statuses[1], {"code": 2, "message": S4_LLM_ERROR_MSG})
+        self.assertEqual(statuses[2], {"code": 2, "message": S4_LLM_ERROR_MSG})
+        self.assertEqual(statuses[3], "ok")
+        self.assertEqual(statuses[4], {"code": 2, "message": S4_TOOL_ERROR_MSG})
+        self.assertEqual(statuses[5], "ok")
+        self.assertEqual(statuses[6], {"code": 2, "message": S4_LLM_ERROR_MSG})
+        self.assertEqual(statuses[7], "ok")
+        self.assertEqual(statuses[8], "unknown")
+        self.assertEqual(spans[1]["attributes"]["error.type"], "LLMError")
+        self.assertEqual(spans[4]["attributes"]["error.type"], "ToolError")
+        self.assertNotIn("error.type", spans[8]["attributes"])
+        self.assertEqual(counters["invalid_status"], 1)
+
+    def test_events_dropped_sums_kept_span_counts_only(self):
+        records = [
+            _rec("claude_code.llm_request", _sid(1), events_count=2),
+            _rec("claude_code.tool", _sid(2), events_count=3),
+            _rec("claude_code.hook", _sid(3), events_count=-1),
+            _rec("claude_code.hook", _sid(4), events_count=True),
+            _rec("claude_code.hook", _sid(5), events_count="4"),
+            _rec("claude_code.hook", _sid(6), events_count=1.5),
+            _rec("claude_code.hook", _sid(7), events_count=None),
+            _rec("claude_code.llm_request", _sid(1), events_count=100),   # duplicate: not counted
+            _rec("foo", _sid(8), events_count=100),                       # unknown: not counted
+        ]
+        del records[4]["events_count"]
+        spans, counters = _map_spans(records)
+        self.assertEqual(len(spans), 7)
+        self.assertEqual(counters["events_dropped"], 5)
+        self.assertEqual(counters["duplicate_spans"], 1)
+        self.assertEqual(counters["unknown_span_types"], 1)
+
+    def test_output_order_is_input_order(self):
+        records = [_rec(span_id=_sid(3)), _rec("foo", _sid(9)), _rec(span_id=_sid(1)), _rec(span_id=_sid(2))]
+        spans, _ = _map_spans(records)
+        self.assertEqual([s["spanId"] for s in spans], [_sid(3), _sid(1), _sid(2)])
+
+    def test_non_dict_records_count_as_invalid_ids(self):
+        spans, counters = _map_spans([None, "x", 5, []])
+        self.assertEqual(spans, [])
+        self.assertEqual(counters["invalid_ids"], 4)
+        self.assertEqual(counters["spans_in"], 4)
+
+    def test_empty_input_gives_all_counters_as_ints(self):
+        spans, counters = _map_spans([])
+        self.assertEqual(spans, [])
+        self.assertEqual(counters, {
+            "spans_in": 0, "spans_out": 0, "unknown_span_types": 0, "invalid_ids": 0,
+            "duplicate_spans": 0, "invalid_status": 0, "events_dropped": 0,
+        })
+
+    def test_every_output_span_and_the_whole_list_pass_bridge_validation(self):
+        records = [
+            _rec("claude_code.interaction", _sid(1)),
+            _rec("claude_code.llm_request", _sid(2), parent=_sid(1),
+                 status={"code": 2, "message": S4_MARKER_MESSAGE}, events_count=1),
+            _rec("claude_code.tool", _sid(3), parent=_sid(1), status={"code": 1}),
+            _rec("claude_code.hook", _sid(4), parent=_sid(3), attributes={"success": False}),
+        ]
+        spans, _ = _map_spans(records)
+        self.assertEqual(len(spans), 4)
+        for span in spans:
+            bridge._validate_flat_spans([span])
+        bridge._validate_flat_spans(spans)
+
+    def test_flatten_lines_then_map_spans_end_to_end(self):
+        span = _span("claude_code.tool")
+        span["status"] = {"code": 2, "message": S4_MARKER_MESSAGE}
+        span["events"] = [{"name": "x"}]
+        line = _line([{"resource": {}, "scopeSpans": [{"spans": [span]}]}])
+        flat, flat_counters = flatten_lines([line])
+        spans, counters = _map_spans(flat)
+        self.assertEqual(flat_counters["spans"], 1)
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["name"], "tool.exec")
+        self.assertEqual(spans[0]["status"], {"code": 2, "message": S4_TOOL_ERROR_MSG})
+        self.assertEqual(counters["events_dropped"], 1)
+        self.assertNotIn("SYNTH_SECRET_0001", json.dumps(spans, ensure_ascii=True))
+        bridge._validate_flat_spans(spans)
+
+    def test_status_messages_and_error_types_are_in_the_sanitize_sets(self):
+        from claude_code_plugin import mapping
+        self.assertIn(S4_LLM_ERROR_MSG, _sanitize.SAFE_ERROR_MESSAGES)
+        self.assertIn(S4_TOOL_ERROR_MSG, _sanitize.SAFE_ERROR_MESSAGES)
+        self.assertIn(S4_OTHER_ERROR_MSG, _sanitize.SAFE_ERROR_MESSAGES)
+        self.assertEqual(mapping.SAFE_MSG["llm"], S4_LLM_ERROR_MSG)
+        self.assertEqual(mapping.SAFE_MSG["tool"], S4_TOOL_ERROR_MSG)
+        self.assertEqual(mapping.SAFE_MSG["other"], S4_OTHER_ERROR_MSG)
+        for kind in ("llm", "tool", "other"):
+            self.assertIn(mapping.SAFE_MSG[kind], _sanitize.SAFE_ERROR_MESSAGES)
+            self.assertEqual(mapping.SAFE_MSG[kind], bridge._real_exporter_error_message(kind))
+        for error_type in mapping.ERROR_TYPE.values():
+            self.assertIn(error_type, _sanitize.SAFE_ERROR_TYPES)
+        self.assertEqual(mapping.ERROR_TYPE, {"llm": "LLMError", "tool": "ToolError", "other": "Unknown"})
+
+    def test_id_patterns_match_bridge_by_value(self):
+        from claude_code_plugin import mapping
+        self.assertEqual(mapping.TRACE_ID_RE.pattern, bridge.TRACE_ID_RE.pattern)
+        self.assertEqual(mapping.TRACE_ID_RE.flags, bridge.TRACE_ID_RE.flags)
+        self.assertEqual(mapping.SPAN_ID_RE.pattern, bridge.SPAN_ID_RE.pattern)
+        self.assertEqual(mapping.SPAN_ID_RE.flags, bridge.SPAN_ID_RE.flags)
+
+
 if __name__ == "__main__":
     unittest.main()
