@@ -48,6 +48,12 @@ class ClaudeCodeVocabBridgeTests(unittest.TestCase):
             names, {"agent.run", "llm.call", "tool.exec", "hook.exec"},
             "SPAN_TYPE_TO_V1 must map to the four fleet span names",
         )
+        self.assertEqual(dict(SPAN_TYPE_TO_V1), {
+            "claude_code.interaction": "agent.run",
+            "claude_code.llm_request": "llm.call",
+            "claude_code.tool": "tool.exec",
+            "claude_code.hook": "hook.exec",
+        })
         extra = names - set(bridge.SPAN_NAMES)
         self.assertEqual(
             extra, set(),
@@ -292,7 +298,8 @@ class StrictAnyValueTests(unittest.TestCase):
         value = spans[0]["attributes"]["gen_ai.usage.input_tokens"]
         self.assertIs(type(value), int)
         self.assertEqual(value, 42)
-        bridge._attribute_value("gen_ai.usage.input_tokens", 42, "span")
+        # Raises BridgeError if the bridge refuses the decoded value.
+        bridge._attribute_value("gen_ai.usage.input_tokens", value, "span")
 
     def test_invalid_any_value_dropped_and_counted(self):
         # Valid items are kept; each invalid item is dropped and counted once.
@@ -402,8 +409,12 @@ class FlattenTimestampTests(unittest.TestCase):
         self.assertEqual(by_id["11" * 8]["endTimeUnixNano"], 3000)
         self.assertIs(type(by_id["11" * 8]["startTimeUnixNano"]), int)
 
-        # Flatten record fed straight into mapper.map_trace (same span dict
-        # shape; no adaptation needed).
+        # Flatten records feed mapper.map_trace directly. Raw status (which may
+        # carry free-text status.message) passes through flatten unchanged and
+        # is cleaned and bounded in the later mapping step. Flatten records also
+        # carry events_count and resource_attributes, which are not in
+        # bridge.RAW_SPAN_KEYS, so these records are not meant for
+        # bridge._validate_flat_spans.
         document, _notes, dropped = mapper.map_trace("a" * 32, spans, "claude-code")
         self.assertIsNone(dropped)
         by_native = {span["native_id"]: span for span in document["spans"]}
@@ -910,6 +921,136 @@ class AttributeDedupAndCapTests(unittest.TestCase):
             "dropped_attributes": 1, "invalid_timestamps": 0, "spans_over_limit": 0,
             "stream_truncated": 0,
         })
+
+
+class RegressionGapTests(unittest.TestCase):
+    ZERO_COUNTERS = {
+        "lines_read": 0, "malformed_lines": 0, "spans": 0, "skipped_items": 0,
+        "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+        "stream_truncated": 0,
+    }
+
+    def test_invalid_end_time_counted(self):
+        # A present but non-digit endTimeUnixNano is None and counted once; the
+        # valid start time is kept.
+        span = _timed_span("a" * 16, "", startTimeUnixNano="1000", endTimeUnixNano="abc")
+        spans, counters = flatten_lines([_line([{"resource": {}, "scopeSpans": [{"spans": [span]}]}])])
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 1, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["startTimeUnixNano"], 1000)
+        self.assertIsNone(spans[0]["endTimeUnixNano"])
+
+    def test_double_overflow_dropped(self):
+        # Behavior predicted from the code and asserted here:
+        # (a) wire text 1e309 is a float literal; _strict_float maps it to inf
+        #     and raises, so the WHOLE line is malformed (not just the attribute).
+        # (b) a huge integer literal as doubleValue parses as an int; float()
+        #     raises OverflowError inside _decode_any_value, so only that
+        #     attribute is dropped (dropped_attributes 1) and the line is kept.
+        template = json.dumps({"resourceSpans": [{"resource": {}, "scopeSpans": [{"spans": [
+            dict(_span(), attributes=[_kv("a.dbl", {"doubleValue": "PLACEHOLDER"})]),
+        ]}]}]})
+        float_line = template.replace('"PLACEHOLDER"', "1e309")
+        self.assertIn("1e309", float_line)
+        spans, counters = flatten_lines([_good_line(), float_line, _good_line()])
+        self.assertEqual(counters, {
+            "lines_read": 3, "malformed_lines": 1, "spans": 2, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+        self.assertEqual(len(spans), 2)
+
+        with self.subTest("huge integer literal as doubleValue: attribute dropped, line kept"):
+            big = json.dumps({"resourceSpans": [{"resource": {}, "scopeSpans": [{"spans": [
+                dict(_span(), attributes=[_kv("a.dbl", {"doubleValue": 10 ** 400})]),
+            ]}]}]})
+            spans, counters = flatten_lines([big])
+            self.assertEqual(counters, {
+                "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+                "dropped_attributes": 1, "invalid_timestamps": 0, "spans_over_limit": 0,
+                "stream_truncated": 0,
+            })
+            self.assertEqual(len(spans), 1)
+            self.assertEqual(spans[0]["attributes"], {})
+
+    def test_int_underflow_dropped(self):
+        # One below int64 minimum is rejected; the int64 minimum itself is kept.
+        below = _line([{"resource": {}, "scopeSpans": [{"spans": [
+            dict(_span(), attributes=[_kv("a.int", {"intValue": "-9223372036854775809"})]),
+        ]}]}])
+        spans, counters = flatten_lines([below])
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 1, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+        self.assertEqual(spans[0]["attributes"], {})
+
+        at_min = _line([{"resource": {}, "scopeSpans": [{"spans": [
+            dict(_span(), attributes=[_kv("a.int", {"intValue": "-9223372036854775808"})]),
+        ]}]}])
+        spans, counters = flatten_lines([at_min])
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+        self.assertIs(type(spans[0]["attributes"]["a.int"]), int)
+        self.assertEqual(spans[0]["attributes"]["a.int"], -(2 ** 63))
+
+    def test_bom_only_lines(self):
+        # A line that is only U+FEFF is blank after one BOM is removed. It is
+        # skipped and not counted, so every counter stays 0.
+        for item in ("\ufeff", "\ufeff".encode("utf-8")):
+            with self.subTest(kind=type(item).__name__):
+                spans, counters = flatten_lines([item])
+                self.assertEqual(spans, [])
+                self.assertEqual(counters, self.ZERO_COUNTERS)
+
+    def test_secret_marker_never_leaks(self):
+        # Synthetic marker. Each hostile line must be handled without raising,
+        # and the marker must never reach counters or kept span records.
+        marker = "SYNTH_SECRET_TOKEN_0001"
+        limit = 4096
+        good = _good_line()
+        self.assertLess(len(good.encode("utf-8")), limit)
+
+        invalid_json = '{"x": "' + marker + '"'  # unterminated: malformed
+        bogus_any = _line([{"resource": {}, "scopeSpans": [{"spans": [
+            dict(_span(), attributes=[_kv("a.bogus", {"bogusValue": marker})]),
+        ]}]}])  # attribute dropped, span kept
+        bad_trace = _line([{"resource": {}, "scopeSpans": [{"spans": [
+            dict(_span(), traceId={"v": marker}),
+        ]}]}])  # non-str identity: span skipped
+        oversize = json.dumps({"resourceSpans": [], "pad": marker * 300})
+        self.assertGreater(len(oversize.encode("utf-8")), limit)
+        surrogate_span = _span()
+        surrogate_span["name"] = "\ud800"
+        surrogate_span["attributes"] = [_kv("a.key", {"stringValue": marker})]
+        surrogate = _line([{"resource": {}, "scopeSpans": [{"spans": [surrogate_span]}]}])
+        self.assertRegex(surrogate, r"\\u[dD]800")  # JSON-escaped lone surrogate
+        events_span = _span()
+        events_span["events"] = [{"name": marker, "timeUnixNano": "1000", "attributes": []}]
+        events = _line([{"resource": {}, "scopeSpans": [{"spans": [events_span]}]}])
+
+        lines = [invalid_json, bogus_any, bad_trace, oversize, surrogate, events, good]
+        with mock.patch.object(adapter_module, "MAX_LINE_BYTES", limit):
+            for kind in ("str", "bytes"):
+                with self.subTest(kind=kind):
+                    items = lines if kind == "str" else [text.encode("utf-8") for text in lines]
+                    spans, counters = flatten_lines(items)
+                    self.assertEqual(counters, {
+                        "lines_read": 7, "malformed_lines": 3, "spans": 3, "skipped_items": 1,
+                        "dropped_attributes": 1, "invalid_timestamps": 0, "spans_over_limit": 0,
+                        "stream_truncated": 0,
+                    })
+                    self.assertEqual(len(spans), 3)
+                    self.assertNotIn(marker, repr(counters))
+                    self.assertNotIn(marker, json.dumps(spans, ensure_ascii=True))
 
 
 if __name__ == "__main__":
