@@ -789,5 +789,91 @@ class LoneSurrogateTests(unittest.TestCase):
         self.assertEqual(spans[1]["name"], literal)
 
 
+class AttributeDedupAndCapTests(unittest.TestCase):
+    # Duplicate keys: first valid value wins, later duplicates are dropped and
+    # counted. The cap counts only kept keys and applies after decoding.
+
+    def test_duplicate_keys_first_wins_and_counted(self):
+        span = _span()
+        span["attributes"] = [
+            _kv("a", {"stringValue": "1"}),
+            _kv("a", {"stringValue": "2"}),
+            _kv("b", {"stringValue": "x"}),
+        ]
+        spans, counters = flatten_lines([_line([{"resource": {}, "scopeSpans": [{"spans": [span]}]}])])
+        self.assertEqual(spans[0]["attributes"], {"a": "1", "b": "x"})
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 1, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+
+    def test_duplicate_invalid_then_valid_same_key(self):
+        # An invalid item does not claim its key: the later valid one is kept.
+        span = _span()
+        span["attributes"] = [
+            _kv("a", {}),
+            _kv("a", {"stringValue": "2"}),
+        ]
+        spans, counters = flatten_lines([_line([{"resource": {}, "scopeSpans": [{"spans": [span]}]}])])
+        self.assertEqual(spans[0]["attributes"], {"a": "2"})
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 1, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+
+    def test_cap_applies_after_decode(self):
+        # Invalid items at the front do not use up the cap: four valid unique
+        # keys are kept after six invalid items.
+        with mock.patch.object(adapter_module, "MAX_ATTRIBUTES_PER_SPAN", 4):
+            span = _span()
+            span["attributes"] = (
+                [_kv("j%d" % i, {}) for i in range(6)]
+                + [_kv("k%d" % i, {"stringValue": str(i)}) for i in range(4)]
+            )
+            spans, counters = flatten_lines([_line([{"resource": {}, "scopeSpans": [{"spans": [span]}]}])])
+        self.assertEqual(spans[0]["attributes"], {"k0": "0", "k1": "1", "k2": "2", "k3": "3"})
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 6, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+
+    def test_cap_counts_remaining_without_decoding(self):
+        # Cap 2: only the first two valid items are decoded. The other three
+        # are counted as dropped without any decode call.
+        with mock.patch.object(adapter_module, "MAX_ATTRIBUTES_PER_SPAN", 2):
+            span = _span()
+            span["attributes"] = [_kv("k%d" % i, {"stringValue": str(i)}) for i in range(5)]
+            original = adapter_module._decode_any_value
+            with mock.patch.object(adapter_module, "_decode_any_value", wraps=original) as spy:
+                spans, counters = flatten_lines([_line([{"resource": {}, "scopeSpans": [{"spans": [span]}]}])])
+        self.assertEqual(spy.call_count, 2)
+        self.assertEqual(spans[0]["attributes"], {"k0": "0", "k1": "1"})
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 3, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+
+    def test_resource_attributes_dedup(self):
+        # Same duplicate rule on resource attributes: first value wins.
+        line = _line([{
+            "resource": {"attributes": [
+                _kv("service.name", {"stringValue": "claude-code"}),
+                _kv("service.name", {"stringValue": "other"}),
+            ]},
+            "scopeSpans": [{"spans": [_span()]}],
+        }])
+        spans, counters = flatten_lines([line])
+        self.assertEqual(spans[0]["resource_attributes"], {"service.name": "claude-code"})
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 1, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+
+
 if __name__ == "__main__":
     unittest.main()

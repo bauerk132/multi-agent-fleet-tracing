@@ -94,28 +94,39 @@ def _attrs_to_dict(attrs):
 
     A KeyValue item is kept only if it is a dict with a str ``key`` and a
     ``value`` that decodes under ``_decode_any_value``. Every other item is
-    dropped and counted once in ``dropped_count``. Only the first
-    ``MAX_ATTRIBUTES_PER_SPAN`` items are decoded; each item past that adds one
-    to ``dropped_count`` and is not iterated. A duplicate key keeps the last
-    value. A non-list ``attrs`` yields ``({}, 0)``; the caller counts that
-    shape as a skipped item.
+    dropped and counted once in ``dropped_count``. Items are read in order and
+    each one is decoded. A duplicate key keeps the FIRST valid value; a later
+    valid item with an already-kept key is dropped and counted. An invalid
+    item never claims its key. The cap counts only kept keys and applies after
+    decoding: once ``MAX_ATTRIBUTES_PER_SPAN`` keys are kept, every remaining
+    item is counted as dropped without being decoded. A non-list ``attrs``
+    yields ``({}, 0)``; the caller counts that shape as a skipped item.
+    Resource and span attributes both go through this function.
     """
     out = {}
     dropped = 0
     if not isinstance(attrs, list):
         return out, 0
     limit = MAX_ATTRIBUTES_PER_SPAN
-    if len(attrs) > limit:
-        dropped += len(attrs) - limit
-    for item in attrs[:limit]:
+    total = len(attrs)
+    index = 0
+    while index < total and len(out) < limit:
+        item = attrs[index]
+        index += 1
         if not isinstance(item, dict) or not isinstance(item.get("key"), str):
             dropped += 1
             continue
+        key = item["key"]
         ok, value = _decode_any_value(item.get("value"))
         if not ok:
             dropped += 1
             continue
-        out[item["key"]] = value
+        if key in out:
+            dropped += 1
+            continue
+        out[key] = value
+    # Cap reached (or list exhausted): everything left is dropped, not decoded.
+    dropped += total - index
     return out, dropped
 
 
@@ -250,10 +261,12 @@ def flatten_lines(lines):
 
     Attribute values follow the OTLP/JSON AnyValue rules in
     ``_attrs_to_dict``. Each rejected KeyValue item adds one to
-    ``dropped_attributes``, and so does each item past the first
-    ``MAX_ATTRIBUTES_PER_SPAN`` in an attributes list (resource or span).
-    Resource attributes are decoded once per resource entry, span attributes
-    once per span.
+    ``dropped_attributes``, and so does each later duplicate of a kept key
+    (first valid value wins). The cap counts only kept keys and applies after
+    decoding: once ``MAX_ATTRIBUTES_PER_SPAN`` keys are kept, each remaining item
+    adds one to ``dropped_attributes`` without being decoded. This holds for
+    resource and span attributes alike. Resource attributes are decoded once per
+    resource entry, span attributes once per span.
 
     Resource bounds (count and skip, never raise): a line over
     ``MAX_LINE_BYTES`` is malformed (see above). Across the whole stream, only
