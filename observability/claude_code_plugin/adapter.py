@@ -19,6 +19,8 @@ _INT64_MAX = 2 ** 63 - 1
 _INT_TEXT = re.compile(r"-?[0-9]{1,19}")
 _TIME_TEXT = re.compile(r"[0-9]{1,20}")
 _UINT64_MAX = 2 ** 64 - 1
+# Any JSON escape for a UTF-16 surrogate code unit (D800 to DFFF, either case).
+_SURROGATE_ESCAPE = re.compile(r"\\u[dD][89a-fA-F]")
 
 # Resource bounds: overflow is counted and skipped, never raised. Read as
 # module globals at call time so tests can patch them. MAX_LINE_BYTES and
@@ -162,6 +164,24 @@ def _text_oversize(text):
         return True
 
 
+def _has_lone_surrogate(text, payload):
+    """True if a parsed line holds a surrogate that cannot be encoded as UTF-8.
+
+    Raw surrogates are rejected before parsing, so one can only come from a
+    JSON escape. The fast path returns False when the text has no surrogate
+    escape. Otherwise the payload is re-serialized and encoded: a correctly
+    paired escape (an emoji) passes, and a literal backslash followed by
+    ``ud800`` is a false positive of the regex that also passes here.
+    """
+    if _SURROGATE_ESCAPE.search(text) is None:
+        return False
+    try:
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    except (UnicodeEncodeError, RecursionError, ValueError):
+        return True
+    return False
+
+
 def _utf8_size(text):
     """UTF-8 byte size of a str for budget charging. Never raises.
 
@@ -254,6 +274,14 @@ def flatten_lines(lines):
     arrives as str or as UTF-8 bytes. A second BOM is left in place and the
     line is malformed. A line that is only a BOM is blank after removal and is
     skipped without being counted.
+
+    Lone surrogates: a JSON escape for a UTF-16 surrogate code unit (hex D800
+    to DFFF) that does not form a valid pair parses to a value that cannot be
+    encoded as UTF-8. Such a line is malformed as a whole, wherever the
+    surrogate appears (span fields, attributes, status, scope or resource), and
+    no spans from it are kept. Correctly paired escapes (an emoji written as two
+    escapes) are accepted. The check runs only on lines that contain a surrogate
+    escape, so ordinary lines are not re-encoded.
     """
     if isinstance(lines, (str, bytes)):
         raise TypeError("flatten_lines expects an iterable of lines, not str or bytes")
@@ -315,6 +343,9 @@ def flatten_lines(lines):
                 text, parse_constant=_reject_constant, parse_float=_strict_float,
             )
         except (ValueError, TypeError, RecursionError):
+            counters["malformed_lines"] += 1
+            continue
+        if _has_lone_surrogate(text, payload):
             counters["malformed_lines"] += 1
             continue
         if not isinstance(payload, dict) or not isinstance(payload.get("resourceSpans"), list):

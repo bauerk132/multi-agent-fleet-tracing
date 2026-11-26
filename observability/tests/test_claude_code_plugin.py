@@ -713,5 +713,81 @@ class StreamBudgetTests(unittest.TestCase):
         self.assertEqual(adapter_module.MAX_TOTAL_BYTES, contract.MAX_BYTES_PER_IMPORT)
 
 
+def _surrogate_line(field, value):
+    """Receiver line with ``value`` placed in ``field``, serialized as receiver.py does."""
+    span = _span()
+    resource_attrs = [_kv("service.name", {"stringValue": "claude-code"})]
+    scope = {"spans": [span]}
+    if field in ("traceId", "spanId", "parentSpanId", "name"):
+        span[field] = value
+    elif field == "attribute key":
+        span["attributes"] = [_kv(value, {"stringValue": "x"})]
+    elif field == "attribute stringValue":
+        span["attributes"] = [_kv("a.key", {"stringValue": value})]
+    elif field == "resource attribute value":
+        resource_attrs = [_kv("service.name", {"stringValue": value})]
+    elif field == "status message":
+        span["status"] = {"code": 2, "message": value}
+    elif field == "status key":
+        span["status"] = {"code": 1, value: "x"}
+    elif field == "scope name":
+        scope["scope"] = {"name": value}
+    else:
+        raise AssertionError(field)
+    obj = {"resourceSpans": [{"resource": {"attributes": resource_attrs}, "scopeSpans": [scope]}]}
+    return json.dumps(obj)
+
+
+class LoneSurrogateTests(unittest.TestCase):
+    def test_escaped_lone_surrogate_line_is_malformed(self):
+        # A JSON-escaped lone surrogate parses to an unpaired code point that
+        # later crashes UTF-8 encoding. The whole line is malformed; the good
+        # line around it still flattens.
+        fields = [
+            "traceId", "spanId", "parentSpanId", "name", "attribute key",
+            "attribute stringValue", "resource attribute value", "status message",
+            "status key", "scope name",
+        ]
+        values = ["\ud800", "\udfff", "\ude00\ud83d"]
+        for field in fields:
+            for value in values:
+                for kind in ("str", "bytes"):
+                    with self.subTest(field=field, value=repr(value), kind=kind):
+                        line = _surrogate_line(field, value)
+                        self.assertRegex(line, r"\\u[dD][89a-fA-F]")
+                        item = line if kind == "str" else line.encode("utf-8")
+                        spans, counters = flatten_lines([item, _good_line()])
+                        self.assertEqual(counters, {
+                            "lines_read": 2, "malformed_lines": 1, "spans": 1,
+                            "skipped_items": 0, "dropped_attributes": 0,
+                            "invalid_timestamps": 0, "spans_over_limit": 0,
+                            "stream_truncated": 0,
+                        })
+                        self.assertEqual(len(spans), 1)
+                        json.dumps(spans, ensure_ascii=False).encode("utf-8")
+                        mapper.run_id_for("0" * 64, spans[0]["traceId"])
+
+    def test_paired_and_backslash_escapes_accepted(self):
+        # A correctly paired surrogate escape (an emoji) decodes to a valid code
+        # point and is kept. A literal backslash followed by ud800 is an escaped
+        # backslash, not a surrogate escape, and is also kept.
+        emoji_line = json.dumps({"resourceSpans": [{"resource": {}, "scopeSpans": [
+            {"spans": [_span("\U0001F600")]},
+        ]}]})
+        self.assertIn("\\ud83d\\ude00", emoji_line)
+        literal = chr(92) + "ud800"
+        literal_line = json.dumps({"resourceSpans": [{"resource": {}, "scopeSpans": [
+            {"spans": [_span(literal)]},
+        ]}]})
+        spans, counters = flatten_lines([emoji_line, literal_line])
+        self.assertEqual(counters, {
+            "lines_read": 2, "malformed_lines": 0, "spans": 2, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+        self.assertEqual(spans[0]["name"], "\U0001F600")
+        self.assertEqual(spans[1]["name"], literal)
+
+
 if __name__ == "__main__":
     unittest.main()
