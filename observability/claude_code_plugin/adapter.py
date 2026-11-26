@@ -272,7 +272,10 @@ def flatten_lines(lines):
     ``MAX_LINE_BYTES`` is malformed (see above). Across the whole stream, only
     the first ``MAX_SPANS`` spans are kept; each later span is skipped and
     counted in ``spans_over_limit``, not in ``skipped_items``. The span cap is
-    checked right after the span-is-a-dict check.
+    checked right after the span-is-a-dict check. Once the cap is reached, the
+    resource attributes of each later resource entry are not decoded and are not
+    counted in ``dropped_attributes`` or ``skipped_items``, since none of its
+    spans can be kept.
 
     Counters are numbers only, never line contents: ``lines_read``
     (non-blank lines seen, oversize lines included), ``malformed_lines``,
@@ -373,7 +376,12 @@ def flatten_lines(lines):
             if resource is None:
                 resource_attrs = {}
             elif isinstance(resource, dict):
-                resource_attrs = _read_attrs(resource.get("attributes"), counters)
+                if counters["spans"] >= MAX_SPANS:
+                    # Cap already reached: no span under this resource can be kept,
+                    # so its attributes are neither decoded nor counted.
+                    resource_attrs = {}
+                else:
+                    resource_attrs = _read_attrs(resource.get("attributes"), counters)
             else:
                 counters["skipped_items"] += 1
                 resource_attrs = {}

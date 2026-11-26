@@ -570,6 +570,43 @@ class ResourceLimitTests(unittest.TestCase):
             })
 
 
+class PostCapResourceTests(unittest.TestCase):
+    # ADJ-R2-P2-02: once the span cap is reached, a later resource entry must
+    # not have its resource attributes decoded at all.
+
+    def _cap_lines(self):
+        first = _line([{"resource": {}, "scopeSpans": [{"spans": [_span()]}]}])
+        # The invalid item would add 1 to dropped_attributes if it were decoded.
+        second = _line([{
+            "resource": {"attributes": [_kv("bad", {})]},
+            "scopeSpans": [{"spans": [_span()]}],
+        }])
+        return [first, second]
+
+    def test_no_resource_decode_after_span_cap(self):
+        original = adapter_module._decode_any_value
+        with mock.patch.object(adapter_module, "MAX_SPANS", 1):
+            with mock.patch.object(adapter_module, "_decode_any_value", wraps=original) as spy:
+                spans, counters = flatten_lines(self._cap_lines())
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(counters, {
+            "lines_read": 2, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 1,
+            "stream_truncated": 0,
+        })
+        self.assertEqual(spy.call_count, 0)
+        self.assertEqual(spans[0]["resource_attributes"], {})
+
+    def test_resource_decoded_before_cap(self):
+        spans, counters = flatten_lines(self._cap_lines())
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(counters, {
+            "lines_read": 2, "malformed_lines": 0, "spans": 2, "skipped_items": 0,
+            "dropped_attributes": 1, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+
+
 class ResourceCopyAndEventRecordTests(unittest.TestCase):
     def test_resource_attributes_not_shared(self):
         # P2-01: each span gets its own copy of the resource attributes, so
