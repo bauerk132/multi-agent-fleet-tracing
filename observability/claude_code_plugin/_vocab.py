@@ -11,15 +11,18 @@ names are unconfirmed until the first real run.
 
 from __future__ import annotations
 
-# Documented Claude Code span types -> fleet v1 span names.
+from types import MappingProxyType
+
+# Documented Claude Code span types -> fleet v1 span names. Read-only: a
+# read-only view, so assignment, deletion and update raise TypeError.
 # tool.execution and tool.blocked_on_user are folded into tool.exec
 # (decision f2), so they have no entry here.
-SPAN_TYPE_TO_V1 = {
+SPAN_TYPE_TO_V1 = MappingProxyType({
     "claude_code.interaction": "agent.run",
     "claude_code.llm_request": "llm.call",
     "claude_code.tool": "tool.exec",
     "claude_code.hook": "hook.exec",
-}
+})
 
 # Attribute keys the adapter may emit. Each one must also be in the
 # AgentScope bridge's ATTRIBUTE_ALLOWLIST (enforced by a test). Anything

@@ -1,8 +1,14 @@
-"""M7-B step 1 tests (unittest): Claude Code adapter vocabulary.
+"""M7-B step 1 tests (unittest): Claude Code adapter vocabulary and flatten.
 
-Covers: vocabulary allowlist subsets (tests 4 and 5), malformed-line
-counting in the flatten step (test 14), and strict OTLP/JSON AnyValue
-decoding with numeric-only counters. Run from observability/:
+Covers: vocabulary checks (non-empty allowlists, subsets of the bridge
+allowlists, disjointness from STRIPPED_KEYS, read-only span-type map),
+malformed-line counting in the flatten step (test 14), flatten robustness
+(bad resource and span shapes, bad identity fields, bytes decoding, NaN and
+Infinity, nesting), strict OTLP/JSON AnyValue decoding with numeric-only
+counters, span timestamps, resource bounds (line size, span cap, attribute
+cap), resource attribute copy per span, events replaced by events_count, and
+BOM handling (one leading BOM removed for str and UTF-8 bytes alike). Run from
+observability/:
     python -m unittest tests.test_claude_code_plugin -v
 """
 
@@ -27,6 +33,7 @@ from claude_code_plugin.adapter import flatten_lines  # noqa: E402
 class ClaudeCodeVocabBridgeTests(unittest.TestCase):
     def test_output_keys_subset_of_bridge_allowlist(self):
         # Test 4: every key the adapter may emit is accepted by the bridge.
+        self.assertTrue(OUTPUT_ATTRIBUTE_KEYS, "OUTPUT_ATTRIBUTE_KEYS must not be empty")
         extra = set(OUTPUT_ATTRIBUTE_KEYS) - set(bridge.ATTRIBUTE_ALLOWLIST)
         self.assertEqual(
             extra, set(),
@@ -35,12 +42,38 @@ class ClaudeCodeVocabBridgeTests(unittest.TestCase):
 
     def test_output_names_subset_of_bridge_span_names(self):
         # Test 5: every fleet span name the adapter may emit is canonical.
+        self.assertTrue(SPAN_TYPE_TO_V1, "SPAN_TYPE_TO_V1 must not be empty")
         names = set(SPAN_TYPE_TO_V1.values())
+        self.assertEqual(
+            names, {"agent.run", "llm.call", "tool.exec", "hook.exec"},
+            "SPAN_TYPE_TO_V1 must map to the four fleet span names",
+        )
         extra = names - set(bridge.SPAN_NAMES)
         self.assertEqual(
             extra, set(),
             f"adapter emits span names the bridge would refuse: {sorted(extra)}",
         )
+
+    def test_output_keys_disjoint_from_stripped_keys(self):
+        # Keys the bridge strips (content, identities, host or user data) must
+        # never be emitted by the adapter.
+        overlap = set(OUTPUT_ATTRIBUTE_KEYS) & set(bridge.STRIPPED_KEYS)
+        self.assertEqual(
+            overlap, set(),
+            f"adapter emits keys the bridge strips: {sorted(overlap)}",
+        )
+
+    def test_span_type_map_is_read_only(self):
+        # The map is shared module state: assignment, deletion and in-place
+        # update must all fail, and the mapping must be unchanged afterwards.
+        before = dict(SPAN_TYPE_TO_V1)
+        with self.assertRaises(TypeError):
+            SPAN_TYPE_TO_V1["claude_code.interaction"] = "tool.exec"
+        with self.assertRaises(TypeError):
+            del SPAN_TYPE_TO_V1["claude_code.hook"]
+        with self.assertRaises(TypeError):
+            dict.update(SPAN_TYPE_TO_V1, {"claude_code.new": "agent.run"})
+        self.assertEqual(dict(SPAN_TYPE_TO_V1), before)
 
 
 # Synthetic helpers: fake hex IDs and the documented span name only.
@@ -405,6 +438,30 @@ class FlattenTimestampTests(unittest.TestCase):
         self.assertEqual(by_id["e" * 16]["startTimeUnixNano"], 5)
         self.assertIs(type(by_id["e" * 16]["startTimeUnixNano"]), int)
         self.assertEqual(by_id["f" * 16]["startTimeUnixNano"], 2 ** 64 - 1)
+
+
+class BomHandlingTests(unittest.TestCase):
+    def test_bom_handled_consistently(self):
+        # One leading BOM is removed for str and UTF-8 bytes alike. Two BOMs
+        # make the line malformed for both.
+        line = _good_line()
+        spans, counters = flatten_lines(["\ufeff" + line])
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(counters["malformed_lines"], 0)
+        str_result = (len(spans), counters["malformed_lines"])
+
+        spans, counters = flatten_lines([b"\xef\xbb\xbf" + line.encode("utf-8")])
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(counters["malformed_lines"], 0)
+        self.assertEqual((len(spans), counters["malformed_lines"]), str_result)
+
+        spans, counters = flatten_lines(["\ufeff\ufeff" + line])
+        self.assertEqual(len(spans), 0)
+        self.assertEqual(counters["malformed_lines"], 1)
+
+        spans, counters = flatten_lines([b"\xef\xbb\xbf\xef\xbb\xbf" + line.encode("utf-8")])
+        self.assertEqual(len(spans), 0)
+        self.assertEqual(counters["malformed_lines"], 1)
 
 
 def _padded_line(total_bytes, filler="x"):

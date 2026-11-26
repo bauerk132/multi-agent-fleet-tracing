@@ -217,8 +217,14 @@ def flatten_lines(lines):
     (non-blank lines seen, oversize lines included), ``malformed_lines``,
     ``spans``, ``skipped_items``, ``dropped_attributes`` (the sum of all
     dropped attribute items), ``invalid_timestamps`` (present span time values
-    that were rejected) and ``spans_over_limit`` (spans skipped by the cap). No
-    BOM handling happens here (a later step).
+    that were rejected) and ``spans_over_limit`` (spans skipped by the cap).
+
+    BOM: after the size check (and after bytes are decoded), exactly one
+    leading U+FEFF character is removed before the line is stripped and parsed. So a
+    line with one BOM parses the same as the same line without it, whether it
+    arrives as str or as UTF-8 bytes. A second BOM is left in place and the
+    line is malformed. A line that is only a BOM is blank after removal and is
+    skipped without being counted.
     """
     if isinstance(lines, (str, bytes)):
         raise TypeError("flatten_lines expects an iterable of lines, not str or bytes")
@@ -250,6 +256,8 @@ def flatten_lines(lines):
             counters["lines_read"] += 1
             counters["malformed_lines"] += 1
             continue
+        if raw.startswith("\ufeff"):
+            raw = raw[1:]
         text = raw.strip()
         if not text:
             continue
