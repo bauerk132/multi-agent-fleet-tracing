@@ -496,5 +496,61 @@ class ResourceLimitTests(unittest.TestCase):
             })
 
 
+class ResourceCopyAndEventRecordTests(unittest.TestCase):
+    def test_resource_attributes_not_shared(self):
+        # P2-01: each span gets its own copy of the resource attributes, so
+        # mutating one span's copy must not change a sibling span's copy.
+        line = _line([{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "claude-code"}},
+            ]},
+            "scopeSpans": [{"spans": [_span(), _span()]}],
+        }])
+        spans, _counters = flatten_lines([line])
+        self.assertEqual(len(spans), 2)
+        self.assertIsNot(spans[0]["resource_attributes"], spans[1]["resource_attributes"])
+
+        spans[0]["resource_attributes"].clear()
+        spans[0]["resource_attributes"]["extra.key"] = "x"
+        self.assertEqual(spans[1]["resource_attributes"], {"service.name": "claude-code"})
+
+    def test_events_replaced_by_count(self):
+        # P2-02: raw events (which can hold exception text) are not carried in
+        # the span record. Only events_count (len of the list) remains.
+        # Fixture is SYNTHETIC: obvious fake marker and stack-like text.
+        span = _span()
+        span["events"] = [
+            {"name": "user_prompt", "timeUnixNano": "1000", "attributes": []},
+            {"name": "tool_result", "timeUnixNano": "2000", "attributes": []},
+            {"name": "exception", "timeUnixNano": "3000", "attributes": [
+                _kv("exception.message", {"stringValue": "SYNTH_RAW_EVENT_TEXT"}),
+                _kv("exception.stacktrace", {
+                    "stringValue": 'Traceback (most recent call last):\n  File "synthetic.py", line 1',
+                }),
+            ]},
+        ]
+        line = _line([{"resource": {}, "scopeSpans": [{"spans": [span]}]}])
+        spans, counters = flatten_lines([line])
+        self.assertEqual(len(spans), 1)
+        record = spans[0]
+        self.assertEqual(record["events_count"], 3)
+        self.assertNotIn("events", record)
+        self.assertNotIn("SYNTH_RAW_EVENT_TEXT", json.dumps(record))
+        self.assertNotIn("SYNTH_RAW_EVENT_TEXT", repr(counters))
+        self.assertNotIn("synthetic.py", json.dumps(record))
+
+    def test_events_count_zero_when_absent_or_not_list(self):
+        no_events = _span()
+        del no_events["events"]
+        not_list = _span()
+        not_list["events"] = {"name": "exception"}
+        line = _line([{"resource": {}, "scopeSpans": [{"spans": [no_events, not_list]}]}])
+        spans, _counters = flatten_lines([line])
+        self.assertEqual(len(spans), 2)
+        for record in spans:
+            self.assertEqual(record["events_count"], 0)
+            self.assertNotIn("events", record)
+
+
 if __name__ == "__main__":
     unittest.main()

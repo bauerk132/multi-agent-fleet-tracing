@@ -168,8 +168,9 @@ def flatten_lines(lines):
     Each span record has: ``name``, ``traceId``, ``spanId``, ``parentSpanId``,
     ``startTimeUnixNano`` and ``endTimeUnixNano`` (int or None; the keys the
     agentscope mapper reads), ``attributes`` (dict), ``resource_attributes``
-    (dict), ``events`` (list, raw; the later mapping step drops it) and
-    ``status`` (raw dict or None).
+    (dict, one copy per span), ``events_count`` (int: the length of the raw
+    events list, or 0 when events is absent or not a list; the raw events are
+    not kept) and ``status`` (raw dict or None).
 
     Times: an int (not a bool) or an ASCII digit string at most 2**64 - 1 is
     normalized to int. A missing or ``None`` time is None and not counted.
@@ -317,8 +318,8 @@ def flatten_lines(lines):
                         "startTimeUnixNano": start_ns,
                         "endTimeUnixNano": end_ns,
                         "attributes": span_attrs,
-                        "resource_attributes": resource_attrs,
-                        "events": span.get("events") if isinstance(span.get("events"), list) else [],
+                        "resource_attributes": dict(resource_attrs),
+                        "events_count": len(span["events"]) if isinstance(span.get("events"), list) else 0,
                         "status": span.get("status") if isinstance(span.get("status"), dict) else None,
                     })
                     counters["spans"] += 1
