@@ -1,4 +1,4 @@
-"""Span mapping for the Claude Code adapter (M7-B step 3, S4 core, S5 attributes, S6 folds).
+"""Span mapping for the Claude Code adapter (M7-B step 3, S4-S7).
 
 map_spans(records) takes the span records produced by adapter.flatten_lines
 and returns (spans, counters). spans is a list of flat v1 span dicts in the
@@ -96,14 +96,40 @@ the records does not change the result (duplicates aside, see below).
 - Output order is still the input order of the kept spans. Folded records are
   not spans, so they leave no gap in that order.
 
+What S7 adds (decision D5): re-parenting after the folds. A kept span whose
+parent was dropped (unknown type, orphan fold, or a folded record) is moved up
+to the nearest kept ancestor, so the output tree stays connected.
+
+- The parent map is built in pass 1 from EVERY record with valid ids (valid
+  traceId, spanId and parentSpanId), including unknown-type records, folded
+  records and orphan folds. Records with bad ids are not in the map. A
+  duplicate does not replace an earlier entry: the first record with a
+  (traceId, spanId) wins, in input order. Unknown-type records still count only
+  in unknown_span_types, and an unknown record with bad ids still counts only
+  in unknown_span_types (not invalid_ids).
+- kept is the set of (traceId, spanId) of the emitted spans. For each emitted
+  span with a parentSpanId P in trace T:
+  - (T, P) in kept: unchanged.
+  - (T, P) not in the map (P never appeared in the input, for example an
+    external TRACEPARENT parent): unchanged, not counted.
+  - Otherwise the walk goes up: P becomes the parent of (T, P) in the map, and
+    so on. The walk ends at a kept span (its spanId becomes the new parent), at
+    an external id (it becomes the new parent, kept as-is), or at a map entry
+    that is None or "" (the span becomes a root). A cycle, or a walk longer
+    than len(map) + 1 steps, also makes the span a root. Results are memoized
+    per (traceId, spanId), so the walk is linear and never recursive.
+  - If the new parent would be the span's own spanId, the span becomes a root
+    instead. A span is never its own parent.
+  - A span whose parentSpanId changed in any way (including removed) is counted
+    once in reparented_spans. A root is represented by the absence of the
+    parentSpanId key.
+- Output order is unchanged, and every span is still a flat v1 span.
+
 Counters: spans_in (every record), spans_out, unknown_span_types, invalid_ids,
 duplicate_spans, invalid_status, events_dropped, stripped_attributes,
-unmapped_attributes, unsafe_values, folded_spans, orphan_folds.
+unmapped_attributes, unsafe_values, folded_spans, orphan_folds, reparented_spans.
 
 Never raises on any record shape: every decision is an explicit type check.
-
-A later step adds S7: re-parenting of spans whose parent was dropped or
-folded. Until S7, a child of a folded span keeps its parentSpanId unchanged.
 """
 
 from __future__ import annotations
@@ -152,6 +178,7 @@ COUNTER_KEYS = (
     "unsafe_values",
     "folded_spans",
     "orphan_folds",
+    "reparented_spans",
 )
 
 # Rank of each outcome when a parent has several (S6): the highest wins.
@@ -330,6 +357,76 @@ def _events_count(record):
     return 0
 
 
+def _resolve_parent(start, parent_map, kept, memo):
+    """Walk up from the (traceId, parentSpanId) key start (S7, D5).
+
+    Returns the new parentSpanId for a span whose parent is start, or None when
+    the span becomes a root. The walk ends at a kept span (its spanId), an
+    external id (never in the input, kept as-is) or a null map entry (root).
+    A cycle, or a walk longer than len(parent_map) + 1 steps, gives a root.
+    Results are memoized per key; the walk is iterative.
+    """
+    limit = len(parent_map) + 1
+    path = []
+    on_path = set()
+    key = start
+    while True:
+        if key in memo:
+            result = memo[key]
+            break
+        if key in kept:
+            result = key[1]
+            break
+        if key not in parent_map:
+            result = key[1]
+            break
+        if key in on_path or len(path) >= limit:
+            result = None
+            break
+        path.append(key)
+        on_path.add(key)
+        nxt = parent_map[key]
+        if not nxt:
+            result = None
+            break
+        key = (key[0], nxt)
+    for node in path:
+        memo[node] = result
+    return result
+
+
+def _reparent(spans, parent_map, counters):
+    """Re-parent kept spans whose parent was dropped or folded (S7, D5), in place.
+
+    A kept parent or an id never seen in the input is left alone (not counted).
+    A span whose parentSpanId changes in any way is counted once in
+    reparented_spans. A span is never made its own parent: that case becomes a
+    root.
+    """
+    kept = {(span["traceId"], span["spanId"]) for span in spans}
+    memo = {}
+    for span in spans:
+        parent = span.get("parentSpanId")
+        if parent is None:
+            continue
+        trace_id = span["traceId"]
+        own = span["spanId"]
+        if parent == own:
+            new_parent = None
+        else:
+            key = (trace_id, parent)
+            if key in kept or key not in parent_map:
+                continue
+            new_parent = _resolve_parent(key, parent_map, kept, memo)
+            if new_parent == own:
+                new_parent = None
+        if new_parent is None:
+            del span["parentSpanId"]
+        else:
+            span["parentSpanId"] = new_parent
+        counters["reparented_spans"] += 1
+
+
 def map_spans(records):
     """Map flatten_lines span records to flat v1 spans. Returns (spans, counters).
 
@@ -341,7 +438,7 @@ def map_spans(records):
     attributes and status. ``counters`` is a dict with the int keys spans_in,
     spans_out, unknown_span_types, invalid_ids, duplicate_spans, invalid_status,
     events_dropped, stripped_attributes, unmapped_attributes, unsafe_values,
-    folded_spans and orphan_folds, all always present.
+    folded_spans, orphan_folds and reparented_spans, all always present.
 
     Routing is by record["name"] only (see the module docstring). Status
     messages from the source are never read or copied. For each kept span, the
@@ -361,6 +458,8 @@ def map_spans(records):
     spans = []
     counters = {key: 0 for key in COUNTER_KEYS}
     seen = set()
+    # (traceId, spanId) -> parentSpanId (None for a root), first record wins (S7).
+    parent_map = {}
     # (traceId, spanId) -> index into tool_entries, for kept claude_code.tool spans.
     tool_index = {}
     # [out_span, own_outcome] for each kept tool span, in input order.
@@ -378,9 +477,7 @@ def map_spans(records):
         name = record.get("name")
         is_fold = isinstance(name, str) and name in _vocab.FOLD_TYPES
         v1_name = _vocab.SPAN_TYPE_TO_V1.get(name) if isinstance(name, str) else None
-        if v1_name is None and not is_fold:
-            counters["unknown_span_types"] += 1
-            continue
+        is_unknown = v1_name is None and not is_fold
 
         trace_id = record.get("traceId")
         span_id = record.get("spanId")
@@ -390,7 +487,19 @@ def map_spans(records):
             or not _valid_id(span_id, SPAN_ID_RE)
             or not _valid_parent(parent_id)
         ):
-            counters["invalid_ids"] += 1
+            # An unknown-type record with bad ids counts only as unknown.
+            if is_unknown:
+                counters["unknown_span_types"] += 1
+            else:
+                counters["invalid_ids"] += 1
+            continue
+
+        # S7: every record with valid ids feeds the parent map, first wins.
+        # Unknown-type records included, but they are never kept.
+        parent_map.setdefault((trace_id, span_id), parent_id or None)
+
+        if is_unknown:
+            counters["unknown_span_types"] += 1
             continue
 
         key = (trace_id, span_id)
@@ -462,5 +571,6 @@ def map_spans(records):
         final = max([own] + parent_outcomes, key=_PRECEDENCE.__getitem__)
         _apply_final(out, final)
 
+    _reparent(spans, parent_map, counters)
     counters["spans_out"] = len(spans)
     return spans, counters

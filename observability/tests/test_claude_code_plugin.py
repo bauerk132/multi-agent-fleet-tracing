@@ -1824,7 +1824,7 @@ class Step3MapSpansCoreTests(unittest.TestCase):
             "spans_in": 0, "spans_out": 0, "unknown_span_types": 0, "invalid_ids": 0,
             "duplicate_spans": 0, "invalid_status": 0, "events_dropped": 0,
             "stripped_attributes": 0, "unmapped_attributes": 0, "unsafe_values": 0,
-            "folded_spans": 0, "orphan_folds": 0,
+            "folded_spans": 0, "orphan_folds": 0, "reparented_spans": 0,
         })
 
     def test_every_output_span_and_the_whole_list_pass_bridge_validation(self):
@@ -2530,6 +2530,197 @@ class Step3FoldTests(unittest.TestCase):
         for span in spans:
             bridge._validate_flat_spans([span])
         bridge._validate_flat_spans(spans)
+
+
+S7_TRACE_2 = "0" * 30 + "02"
+
+
+def _s7_unknown(span_id, parent=None, trace_id=S4_TRACE):
+    # A record whose name is not a source type: dropped, but its ids still count.
+    return _rec("agent.run", span_id, trace_id=trace_id, parent=parent)
+
+
+def _s7_llm(span_id, parent=None, trace_id=S4_TRACE):
+    return _rec("claude_code.llm_request", span_id, trace_id=trace_id, parent=parent)
+
+
+class Step3ReparentTests(unittest.TestCase):
+    """M7-B step 3 S7: re-parent kept spans whose parent was dropped or folded."""
+
+    def test_child_of_dropped_unknown_gets_grandparent(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1)),
+            _s7_unknown(_sid(2), parent=_sid(1)),
+            _s7_llm(_sid(3), parent=_sid(2)),
+        ])
+        self.assertEqual([s["spanId"] for s in spans], [_sid(1), _sid(3)])
+        self.assertNotIn("parentSpanId", spans[0])
+        self.assertEqual(spans[1]["parentSpanId"], _sid(1))
+        self.assertEqual(counters["reparented_spans"], 1)
+        self.assertEqual(counters["unknown_span_types"], 1)
+
+    def test_chain_of_dropped_ancestors_gives_nearest_kept_ancestor(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1)),
+            _s7_llm(_sid(2), parent=_sid(1)),
+            _s7_unknown(_sid(3), parent=_sid(2)),
+            _s7_unknown(_sid(4), parent=_sid(3)),
+            _s7_unknown(_sid(5), parent=_sid(4)),
+            _s7_llm(_sid(6), parent=_sid(5)),
+        ])
+        self.assertEqual(spans[-1]["parentSpanId"], _sid(2))
+        self.assertEqual(counters["reparented_spans"], 1)
+        self.assertEqual(counters["unknown_span_types"], 3)
+
+    def test_no_kept_ancestor_makes_child_a_root_and_counts_it(self):
+        spans, counters = _map_spans([
+            _s7_unknown(_sid(1)),
+            _s7_unknown(_sid(2), parent=_sid(1)),
+            _s7_llm(_sid(3), parent=_sid(2)),
+        ])
+        self.assertEqual(len(spans), 1)
+        self.assertNotIn("parentSpanId", spans[0])
+        self.assertEqual(counters["reparented_spans"], 1)
+
+    def test_external_parent_is_kept_and_not_counted(self):
+        spans, counters = _map_spans([_s7_llm(_sid(1), parent=_sid(99))])
+        self.assertEqual(spans[0]["parentSpanId"], _sid(99))
+        self.assertEqual(counters["reparented_spans"], 0)
+
+    def test_parent_cycle_among_dropped_spans_terminates_as_root(self):
+        spans, counters = _map_spans([
+            _s7_unknown(_sid(1), parent=_sid(2)),
+            _s7_unknown(_sid(2), parent=_sid(1)),
+            _s7_llm(_sid(3), parent=_sid(1)),
+        ])
+        self.assertEqual(len(spans), 1)
+        self.assertNotIn("parentSpanId", spans[0])
+        self.assertEqual(counters["reparented_spans"], 1)
+
+    def test_child_of_folded_execution_gets_the_tool_span(self):
+        spans, counters = _map_spans([
+            _s6_tool(span_id=_sid(1), status={"code": 1}),
+            _s6_exec(span_id=_sid(2), parent=_sid(1)),
+            _s7_llm(_sid(3), parent=_sid(2)),
+        ])
+        self.assertEqual([s["spanId"] for s in spans], [_sid(1), _sid(3)])
+        self.assertEqual(spans[1]["parentSpanId"], _sid(1))
+        self.assertEqual(counters["folded_spans"], 1)
+        self.assertEqual(counters["reparented_spans"], 1)
+
+    def test_child_of_folded_blocked_on_user_gets_the_tool_span(self):
+        spans, counters = _map_spans([
+            _s6_tool(span_id=_sid(1)),
+            _s6_block(span_id=_sid(2), parent=_sid(1), attributes={"decision": "accept"}),
+            _s7_llm(_sid(3), parent=_sid(2)),
+        ])
+        self.assertEqual(spans[1]["parentSpanId"], _sid(1))
+        self.assertEqual(counters["reparented_spans"], 1)
+
+    def test_child_of_orphan_fold_walks_past_it(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1)),
+            _s6_exec(span_id=_sid(2), parent=_sid(1)),  # parent is an llm span: orphan
+            _s7_llm(_sid(3), parent=_sid(2)),
+        ])
+        self.assertEqual(counters["orphan_folds"], 1)
+        self.assertEqual(spans[1]["parentSpanId"], _sid(1))
+        self.assertEqual(counters["reparented_spans"], 1)
+
+    def test_kept_parent_is_unchanged_and_not_counted(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1)),
+            _s7_llm(_sid(2), parent=_sid(1)),
+        ])
+        self.assertEqual(spans[1]["parentSpanId"], _sid(1))
+        self.assertEqual(counters["reparented_spans"], 0)
+
+    def test_same_span_id_in_another_trace_does_not_confuse_the_walk(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1)),
+            _s7_unknown(_sid(2), parent=_sid(1)),
+            _s7_llm(_sid(3), parent=_sid(2)),
+            _s7_llm(_sid(2), trace_id=S7_TRACE_2),
+            _s7_unknown(_sid(9), parent=_sid(2), trace_id=S7_TRACE_2),
+        ])
+        by_key = {(s["traceId"], s["spanId"]): s for s in spans}
+        self.assertEqual(by_key[(S4_TRACE, _sid(3))]["parentSpanId"], _sid(1))
+        self.assertNotIn("parentSpanId", by_key[(S7_TRACE_2, _sid(2))])
+        self.assertEqual(counters["reparented_spans"], 1)
+
+    def test_span_never_becomes_its_own_parent(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1), parent=_sid(2)),
+            _s7_unknown(_sid(2), parent=_sid(1)),
+        ])
+        self.assertEqual(len(spans), 1)
+        self.assertNotIn("parentSpanId", spans[0])
+        self.assertEqual(counters["reparented_spans"], 1)
+
+    def test_output_order_is_unchanged(self):
+        spans, _ = _map_spans([
+            _s7_llm(_sid(5)),
+            _s7_unknown(_sid(1), parent=_sid(5)),
+            _s7_llm(_sid(2), parent=_sid(1)),
+            _s7_llm(_sid(4), parent=_sid(5)),
+            _s7_llm(_sid(3), parent=_sid(1)),
+        ])
+        self.assertEqual([s["spanId"] for s in spans],
+                         [_sid(5), _sid(2), _sid(4), _sid(3)])
+        self.assertEqual(spans[1]["parentSpanId"], _sid(5))
+        self.assertEqual(spans[3]["parentSpanId"], _sid(5))
+
+    def test_unknown_with_bad_ids_neither_counts_invalid_nor_enters_the_map(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1)),
+            _s7_unknown(_sid(2), parent=_sid(1), trace_id="g" * 32),
+            _s7_llm(_sid(3), parent=_sid(2)),
+        ])
+        self.assertEqual(counters["unknown_span_types"], 1)
+        self.assertEqual(counters["invalid_ids"], 0)
+        self.assertEqual(spans[1]["parentSpanId"], _sid(2))
+        self.assertEqual(counters["reparented_spans"], 0)
+
+    def test_invalid_id_span_is_not_in_the_map(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1)),
+            _s7_llm(_sid(2), parent="0" * 15),
+            _s7_llm(_sid(3), parent=_sid(2)),
+        ])
+        self.assertEqual(counters["invalid_ids"], 1)
+        self.assertEqual(spans[1]["parentSpanId"], _sid(2))
+        self.assertEqual(counters["reparented_spans"], 0)
+
+    def test_two_thousand_dropped_ancestors_complete_without_recursion(self):
+        records = [_s7_llm(_sid(1))]
+        for number in range(2, 2002):
+            records.append(_s7_unknown(_sid(number), parent=_sid(number - 1)))
+        records.append(_s7_llm(_sid(2002), parent=_sid(2001)))
+        spans, counters = _map_spans(records)
+        self.assertEqual(spans[-1]["parentSpanId"], _sid(1))
+        self.assertEqual(counters["reparented_spans"], 1)
+        self.assertEqual(counters["unknown_span_types"], 2000)
+
+    def test_reparented_tree_passes_bridge_and_mapper(self):
+        spans, _ = _map_spans([
+            _s6_tool(span_id=_sid(1), status={"code": 1}),
+            _s6_exec(span_id=_sid(2), parent=_sid(1), attributes={"success": False}),
+            _s7_unknown(_sid(3), parent=_sid(1)),
+            _s7_llm(_sid(4), parent=_sid(3)),
+            _s7_unknown(_sid(5), parent=_sid(4)),
+            _s7_llm(_sid(6), parent=_sid(5)),
+        ])
+        for span in spans:
+            bridge._validate_flat_spans([span])
+        bridge._validate_flat_spans(spans)
+        raw = json.dumps(spans, sort_keys=True).encode("utf-8")
+        self.assertIsNotNone(bridge._parse_source_snapshot(raw, "claude-code"))
+        document, _notes, dropped = mapper.map_trace(S4_TRACE, spans, "claude-code")
+        self.assertIsNone(dropped)
+        self.assertIsNotNone(document)
+        by_native = {span["native_id"]: span for span in document["spans"]}
+        self.assertEqual(by_native[_sid(6)]["parent_native_id"], _sid(4))
+        self.assertEqual(by_native[_sid(4)]["parent_native_id"], _sid(1))
 
 
 if __name__ == "__main__":
