@@ -1604,11 +1604,9 @@ class Step3MapSpansCoreTests(unittest.TestCase):
         self.assertEqual(counters["spans_out"], 4)
         self.assertEqual(counters["unknown_span_types"], 0)
 
-    def test_unknown_and_fold_names_are_dropped_and_counted(self):
+    def test_unknown_names_are_dropped_and_counted(self):
         dropped_names = [
             "agent.run",
-            "claude_code.tool.execution",
-            "claude_code.tool.blocked_on_user",
             "foo",
             "claude_code.Tool",
             "claude_code.tool ",
@@ -1826,6 +1824,7 @@ class Step3MapSpansCoreTests(unittest.TestCase):
             "spans_in": 0, "spans_out": 0, "unknown_span_types": 0, "invalid_ids": 0,
             "duplicate_spans": 0, "invalid_status": 0, "events_dropped": 0,
             "stripped_attributes": 0, "unmapped_attributes": 0, "unsafe_values": 0,
+            "folded_spans": 0, "orphan_folds": 0,
         })
 
     def test_every_output_span_and_the_whole_list_pass_bridge_validation(self):
@@ -2230,6 +2229,306 @@ class Step3AttributeMappingTests(unittest.TestCase):
         for marker in S5_MARKERS:
             self.assertNotIn(marker, out)
             self.assertNotIn(marker, repr(counters))
+        bridge._validate_flat_spans(spans)
+
+
+S6_OTHER_TRACE = "0" * 30 + "03"
+S6_MARKER = "SYNTH_SECRET_0001"
+S6_UUID_A = "123e4567-e89b-12d3-a456-426614174000"
+S6_UUID_B = "223e4567-e89b-12d3-a456-426614174001"
+
+
+def _s6_tool(span_id=None, **kwargs):
+    return _rec("claude_code.tool", span_id or _sid(1), **kwargs)
+
+
+def _s6_exec(span_id=None, parent=_sid(1), **kwargs):
+    return _rec("claude_code.tool.execution", span_id or _sid(2), parent=parent, **kwargs)
+
+
+def _s6_block(span_id=None, parent=_sid(1), **kwargs):
+    return _rec("claude_code.tool.blocked_on_user", span_id or _sid(3), parent=parent, **kwargs)
+
+
+class Step3FoldTests(unittest.TestCase):
+    """M7-B step 3 S6: fold claude_code.tool.execution and blocked_on_user into their parent tool span."""
+
+    def test_execution_success_false_makes_parent_error(self):
+        spans, counters = _map_spans([_s6_tool(), _s6_exec(attributes={"success": False})])
+        self.assertEqual([s["name"] for s in spans], ["tool.exec"])
+        self.assertEqual(spans[0]["status"], {"code": 2, "message": S4_TOOL_ERROR_MSG})
+        self.assertEqual(spans[0]["attributes"]["error.type"], "ToolError")
+        self.assertEqual(counters["folded_spans"], 1)
+        self.assertEqual(counters["orphan_folds"], 0)
+
+    def test_execution_status_code_2_makes_parent_error(self):
+        spans, _ = _map_spans([
+            _s6_tool(), _s6_exec(status={"code": 2, "message": S4_MARKER_MESSAGE}),
+        ])
+        self.assertEqual(spans[0]["status"], {"code": 2, "message": S4_TOOL_ERROR_MSG})
+        self.assertEqual(spans[0]["attributes"]["error.type"], "ToolError")
+
+    def test_execution_success_true_makes_parent_ok(self):
+        spans, counters = _map_spans([_s6_tool(), _s6_exec(attributes={"success": True})])
+        self.assertEqual(spans[0]["status"], "ok")
+        self.assertNotIn("error.type", spans[0]["attributes"])
+        self.assertEqual(counters["folded_spans"], 1)
+
+    def test_execution_status_code_1_makes_parent_ok(self):
+        spans, _ = _map_spans([_s6_tool(), _s6_exec(status={"code": 1})])
+        self.assertEqual(spans[0]["status"], "ok")
+        self.assertNotIn("error.type", spans[0]["attributes"])
+
+    def test_execution_without_signal_leaves_parent_unknown(self):
+        spans, counters = _map_spans([_s6_tool(), _s6_exec()])
+        self.assertEqual(spans[0]["status"], "unknown")
+        self.assertNotIn("error.type", spans[0]["attributes"])
+        self.assertEqual(counters["folded_spans"], 1)
+
+    def test_blocked_reject_and_cancelled_make_parent_cancelled(self):
+        for decision in ("reject", "cancelled"):
+            with self.subTest(decision=decision):
+                spans, counters = _map_spans([
+                    _s6_tool(), _s6_block(attributes={"decision": decision}),
+                ])
+                self.assertEqual(spans[0]["status"], "cancelled")
+                self.assertEqual(spans[0]["attributes"]["error.type"], "Cancelled")
+                self.assertEqual(counters["folded_spans"], 1)
+
+    def test_blocked_accept_and_other_decisions_leave_parent_unchanged(self):
+        baseline_spans, _ = _map_spans([_s6_tool(status={"code": 1})])
+        for decision in ("accept", "Reject", "", None, 5):
+            with self.subTest(decision=decision):
+                spans, counters = _map_spans([
+                    _s6_tool(status={"code": 1}), _s6_block(attributes={"decision": decision}),
+                ])
+                self.assertEqual(spans, baseline_spans)
+                self.assertEqual(counters["folded_spans"], 1)
+
+    def test_error_beats_cancelled_on_the_same_parent_in_any_order(self):
+        import itertools
+        factories = (
+            lambda: _s6_tool(),
+            lambda: _s6_exec(attributes={"success": False}),
+            lambda: _s6_block(attributes={"decision": "reject"}),
+        )
+        for index, order in enumerate(itertools.permutations(factories)):
+            with self.subTest(order=index):
+                spans, _ = _map_spans([make() for make in order])
+                self.assertEqual(spans[0]["status"], {"code": 2, "message": S4_TOOL_ERROR_MSG})
+                self.assertEqual(spans[0]["attributes"]["error.type"], "ToolError")
+
+    def test_parent_own_error_stays_error_against_ok_and_accept(self):
+        spans, _ = _map_spans([
+            _s6_tool(status={"code": 2, "message": S4_MARKER_MESSAGE}),
+            _s6_exec(span_id=_sid(2), attributes={"success": True}),
+            _s6_block(span_id=_sid(3), attributes={"decision": "accept"}),
+        ])
+        self.assertEqual(spans[0]["status"], {"code": 2, "message": S4_TOOL_ERROR_MSG})
+        self.assertEqual(spans[0]["attributes"]["error.type"], "ToolError")
+
+    def test_cancelled_beats_ok_in_any_order(self):
+        import itertools
+        factories = (
+            lambda: _s6_tool(status={"code": 1}),
+            lambda: _s6_exec(attributes={"success": True}),
+            lambda: _s6_block(attributes={"decision": "cancelled"}),
+        )
+        for index, order in enumerate(itertools.permutations(factories)):
+            with self.subTest(order=index):
+                spans, _ = _map_spans([make() for make in order])
+                self.assertEqual(spans[0]["status"], "cancelled")
+                self.assertEqual(spans[0]["attributes"]["error.type"], "Cancelled")
+
+    def test_execution_before_parent_in_input_still_folds(self):
+        spans, counters = _map_spans([
+            _s6_exec(attributes={"success": False}), _s6_tool(),
+        ])
+        self.assertEqual([s["name"] for s in spans], ["tool.exec"])
+        self.assertEqual(spans[0]["status"], {"code": 2, "message": S4_TOOL_ERROR_MSG})
+        self.assertEqual(counters["folded_spans"], 1)
+        self.assertEqual(counters["orphan_folds"], 0)
+
+    def test_fold_split_across_two_flatten_lines_still_folds(self):
+        tool_span = _span("claude_code.tool")
+        exec_span = _span("claude_code.tool.execution")
+        exec_span["spanId"] = "c" * 16
+        exec_span["parentSpanId"] = "b" * 16
+        exec_span["attributes"] = [_kv("success", {"boolValue": False})]
+        exec_span["status"] = {"code": 0}
+        line_one = _line([{"resource": {}, "scopeSpans": [{"spans": [tool_span]}]}])
+        line_two = _line([{"resource": {}, "scopeSpans": [{"spans": [exec_span]}]}])
+        flat, _ = flatten_lines([line_one, line_two])
+        spans, counters = _map_spans(flat)
+        self.assertEqual([s["name"] for s in spans], ["tool.exec"])
+        self.assertEqual(spans[0]["status"], {"code": 2, "message": S4_TOOL_ERROR_MSG})
+        self.assertEqual(counters["folded_spans"], 1)
+        bridge._validate_flat_spans(spans)
+
+    def test_orphan_no_parent_is_dropped_and_not_promoted(self):
+        spans, counters = _map_spans([
+            _s6_tool(), _s6_exec(parent=None, attributes={"success": False}),
+        ])
+        self.assertEqual(counters["orphan_folds"], 1)
+        self.assertEqual(counters["folded_spans"], 0)
+        self.assertEqual(spans[0]["status"], "unknown")
+        self.assertEqual(len(spans), 1)
+
+    def test_orphan_missing_parent_is_dropped_and_not_promoted(self):
+        spans, counters = _map_spans([
+            _s6_tool(), _s6_exec(parent=_sid(9), attributes={"success": False}),
+        ])
+        self.assertEqual(counters["orphan_folds"], 1)
+        self.assertEqual(counters["folded_spans"], 0)
+        self.assertEqual(spans[0]["status"], "unknown")
+        self.assertEqual(len(spans), 1)
+
+    def test_orphan_parent_in_other_trace_is_dropped(self):
+        other_tool = _rec("claude_code.tool", _sid(1), trace_id=S6_OTHER_TRACE)
+        spans, counters = _map_spans([
+            other_tool, _s6_exec(attributes={"success": False}),
+        ])
+        self.assertEqual(counters["orphan_folds"], 1)
+        self.assertEqual(counters["folded_spans"], 0)
+        self.assertEqual([s["name"] for s in spans], ["tool.exec"])
+        self.assertEqual(spans[0]["traceId"], S6_OTHER_TRACE)
+        self.assertEqual(spans[0]["status"], "unknown")
+        self.assertNotIn("error.type", spans[0]["attributes"])
+
+    def test_orphan_parent_is_llm_request_is_dropped(self):
+        spans, counters = _map_spans([
+            _rec("claude_code.llm_request", _sid(1)),
+            _s6_exec(attributes={"success": False}),
+        ])
+        self.assertEqual(counters["orphan_folds"], 1)
+        self.assertEqual(counters["folded_spans"], 0)
+        self.assertEqual([s["name"] for s in spans], ["llm.call"])
+        self.assertEqual(spans[0]["status"], "unknown")
+        self.assertNotIn("error.type", spans[0]["attributes"])
+
+    def test_folded_execution_marker_never_reaches_output_or_counters(self):
+        exec_record = _s6_exec(
+            attributes={
+                "success": False,
+                "error": "Error:ENOENT /home/synth/SYNTH_SECRET_0001",
+                "error_class": S6_MARKER,
+                "tool_use_id": "toolu_SYNTH_SECRET_0001",
+            },
+            status={"code": 2, "message": "failed C:\\Users\\synth token=SYNTH_SECRET_0001"},
+        )
+        block_record = _s6_block(
+            span_id=_sid(3),
+            attributes={"decision": "reject", "error": "/home/synth/SYNTH_SECRET_0001"},
+        )
+        spans, counters = _map_spans([_s6_tool(), exec_record, block_record])
+        self.assertEqual(spans[0]["status"], {"code": 2, "message": S4_TOOL_ERROR_MSG})
+        self.assertNotIn(S6_MARKER, json.dumps(spans, ensure_ascii=True))
+        self.assertNotIn(S6_MARKER, json.dumps(counters, ensure_ascii=True))
+        self.assertNotIn(S6_MARKER, repr(counters))
+        self.assertNotIn("toolu_SYNTH", json.dumps(spans, ensure_ascii=True))
+
+    def test_fold_counters_are_exact(self):
+        records = [
+            _s6_tool(span_id=_sid(1)),
+            _s6_exec(span_id=_sid(2), parent=_sid(1)),
+            _s6_exec(span_id=_sid(4), parent=_sid(1)),
+            _s6_block(span_id=_sid(5), parent=_sid(1)),
+            _s6_exec(span_id=_sid(6), parent=_sid(9)),                 # orphan
+            _s6_tool(span_id=_sid(7)),
+            _s6_block(span_id=_sid(8), parent=_sid(7)),                # folded
+            _s6_block(span_id=_sid(10), parent=None),                  # orphan
+        ]
+        spans, counters = _map_spans(records)
+        self.assertEqual([s["spanId"] for s in spans], [_sid(1), _sid(7)])
+        self.assertEqual(counters["folded_spans"], 4)
+        self.assertEqual(counters["orphan_folds"], 2)
+        self.assertEqual(counters["spans_in"], 8)
+        self.assertEqual(counters["spans_out"], 2)
+        self.assertEqual(counters["unknown_span_types"], 0)
+        self.assertEqual(counters["duplicate_spans"], 0)
+        self.assertEqual(counters["invalid_ids"], 0)
+
+    def test_fold_records_add_no_events_attributes_or_unknowns(self):
+        _, baseline = _map_spans([_s6_tool(status={"code": 1})])
+        spans, counters = _map_spans([
+            _s6_tool(status={"code": 1}),
+            _s6_exec(events_count=5, attributes={
+                "user.email": "synth.user@example.test",
+                "foo": "bar",
+                "tool_input": "x",
+                "success": True,
+            }),
+        ])
+        self.assertEqual(counters["events_dropped"], 0)
+        self.assertEqual(counters["unknown_span_types"], 0)
+        self.assertEqual(counters["stripped_attributes"], baseline["stripped_attributes"])
+        self.assertEqual(counters["unmapped_attributes"], baseline["unmapped_attributes"])
+        self.assertEqual(counters["unsafe_values"], baseline["unsafe_values"])
+
+    def test_fold_records_with_bad_ids_count_invalid_ids(self):
+        spans, counters = _map_spans([
+            _s6_tool(),
+            _s6_exec(span_id="0" * 15),                               # bad span id
+            _s6_exec(span_id=_sid(4), trace_id="g" * 32),             # bad trace id
+            _s6_exec(span_id=_sid(5), parent="0" * 15),               # bad parent id
+            _s6_block(span_id=_sid(6), parent="0" * 17),              # bad parent id
+        ])
+        self.assertEqual(counters["invalid_ids"], 4)
+        self.assertEqual(counters["folded_spans"], 0)
+        self.assertEqual(counters["orphan_folds"], 0)
+        self.assertEqual(spans[0]["status"], "unknown")
+
+    def test_duplicate_fold_record_counts_duplicate_and_first_wins(self):
+        spans, counters = _map_spans([
+            _s6_tool(),
+            _s6_exec(attributes={"success": False}),
+            _s6_exec(attributes={"success": True}),
+        ])
+        self.assertEqual(counters["duplicate_spans"], 1)
+        self.assertEqual(counters["folded_spans"], 1)
+        self.assertEqual(spans[0]["status"], {"code": 2, "message": S4_TOOL_ERROR_MSG})
+
+    def test_invalid_execution_status_counts_invalid_status_when_folded(self):
+        spans, counters = _map_spans([
+            _s6_tool(status={"code": 1}),
+            _s6_exec(status={"code": True}, attributes={"success": True}),
+        ])
+        self.assertEqual(counters["invalid_status"], 1)
+        self.assertEqual(spans[0]["status"], "ok")
+
+    def test_parent_attributes_unchanged_by_fold(self):
+        parent_attributes = {
+            "tool_name": "Read",
+            "tool_use_id": "toolu_01ABCdef",
+            "session.id": S6_UUID_A,
+        }
+        baseline_spans, _ = _map_spans([_s6_tool(status={"code": 1}, attributes=parent_attributes)])
+        spans, _ = _map_spans([
+            _s6_tool(status={"code": 1}, attributes=parent_attributes),
+            _s6_exec(attributes={"success": False, "tool_name": "Bash", "session.id": S6_UUID_B}),
+        ])
+        attributes = spans[0]["attributes"]
+        self.assertEqual(attributes["gen_ai.tool.name"], "Read")
+        self.assertEqual(attributes["gen_ai.tool.call.id"], "toolu_01ABCdef")
+        self.assertEqual(attributes["session.id"], S6_UUID_A)
+        expected = dict(baseline_spans[0]["attributes"])
+        expected["error.type"] = "ToolError"
+        self.assertEqual(attributes, expected)
+
+    def test_fold_outputs_pass_bridge_validation(self):
+        spans, _ = _map_spans([
+            _s6_tool(span_id=_sid(1)),
+            _s6_exec(span_id=_sid(2), parent=_sid(1), attributes={"success": False}),
+            _s6_tool(span_id=_sid(3)),
+            _s6_block(span_id=_sid(4), parent=_sid(3), attributes={"decision": "reject"}),
+            _s6_tool(span_id=_sid(5)),
+            _s6_exec(span_id=_sid(6), parent=_sid(5), attributes={"success": True}),
+        ])
+        self.assertEqual([s["status"] for s in spans], [
+            {"code": 2, "message": S4_TOOL_ERROR_MSG}, "cancelled", "ok",
+        ])
+        for span in spans:
+            bridge._validate_flat_spans([span])
         bridge._validate_flat_spans(spans)
 
 
