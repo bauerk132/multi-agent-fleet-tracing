@@ -1825,6 +1825,7 @@ class Step3MapSpansCoreTests(unittest.TestCase):
         self.assertEqual(counters, {
             "spans_in": 0, "spans_out": 0, "unknown_span_types": 0, "invalid_ids": 0,
             "duplicate_spans": 0, "invalid_status": 0, "events_dropped": 0,
+            "stripped_attributes": 0, "unmapped_attributes": 0, "unsafe_values": 0,
         })
 
     def test_every_output_span_and_the_whole_list_pass_bridge_validation(self):
@@ -1877,6 +1878,359 @@ class Step3MapSpansCoreTests(unittest.TestCase):
         self.assertEqual(mapping.TRACE_ID_RE.flags, bridge.TRACE_ID_RE.flags)
         self.assertEqual(mapping.SPAN_ID_RE.pattern, bridge.SPAN_ID_RE.pattern)
         self.assertEqual(mapping.SPAN_ID_RE.flags, bridge.SPAN_ID_RE.flags)
+
+
+S5_UUID_LOWER = "123e4567-e89b-12d3-a456-426614174000"
+S5_UUID_UPPER = "123E4567-E89B-12D3-A456-426614174000"
+S5_CONSTANTS = {"agent.name": "claude-code", "observation.source": "otel-export"}
+S5_COUNT_KEYS = ("stripped_attributes", "unmapped_attributes", "unsafe_values")
+S5_TYPES = (
+    "claude_code.interaction",
+    "claude_code.llm_request",
+    "claude_code.tool",
+    "claude_code.hook",
+)
+S5_MARKERS = (
+    "SYNTH_SECRET_0001",
+    "synth.user@example.test",
+    "000000000000",
+    "secret.txt",
+    "privsrv",
+)
+S5_HOSTILE_MODELS = (
+    "sk-ant-SYNTH0001",
+    "synth.user@example.test",
+    "a" * 300,
+    "claude\x1bx",
+    "arn:aws:bedrock:us-east-1:000000000000:foundation-model/x",
+)
+S5_TOKEN_SOURCES = (
+    ("input_tokens", "gen_ai.usage.input_tokens"),
+    ("output_tokens", "gen_ai.usage.output_tokens"),
+    ("cache_read_tokens", "gen_ai.usage.cache_read.input_tokens"),
+    ("cache_creation_tokens", "gen_ai.usage.cache_creation.input_tokens"),
+)
+S5_BAD_COUNTS = (-1, True, "12", 1.5)
+# IDs without runs of zeros, so the marker check "000000000000" only sees values.
+S5_TRACE = "c" * 32
+S5_SPAN = "d" * 14 + "01"
+
+
+def _s5_id(number):
+    return "d" * 14 + format(number, "02x")
+
+
+def _s5_map(name, attributes=None, resource=None, status=None, span_id=S5_SPAN):
+    # One record of the given name; resource_attributes is {} unless given.
+    record = _rec(name, span_id, trace_id=S5_TRACE, attributes=attributes, status=status)
+    record["resource_attributes"] = dict(resource or {})
+    return _map_spans([record])
+
+
+def _s5_counts(counters):
+    return {key: counters[key] for key in S5_COUNT_KEYS}
+
+
+class Step3AttributeMappingTests(unittest.TestCase):
+    """M7-B step 3 S5: attribute mapping, sanitization and the attribute counters."""
+
+    def assertOnlyAttributes(self, span, expected):
+        self.assertEqual(span["attributes"], dict(S5_CONSTANTS, **expected))
+
+    def assertCounts(self, counters, stripped=0, unmapped=0, unsafe=0):
+        self.assertEqual(_s5_counts(counters), {
+            "stripped_attributes": stripped,
+            "unmapped_attributes": unmapped,
+            "unsafe_values": unsafe,
+        })
+
+    def test_hostile_model_in_gen_ai_request_model_position_is_dropped(self):
+        for value in S5_HOSTILE_MODELS:
+            with self.subTest(value=value):
+                spans, counters = _s5_map("claude_code.llm_request", {
+                    "gen_ai.request.model": value,
+                    "session.id": S5_UUID_LOWER,
+                    "input_tokens": 5,
+                })
+                self.assertEqual(len(spans), 1)
+                self.assertOnlyAttributes(spans[0], {
+                    "session.id": S5_UUID_LOWER,
+                    "gen_ai.usage.input_tokens": 5,
+                })
+                self.assertCounts(counters, unsafe=1)
+                bridge._validate_flat_spans(spans)
+
+    def test_hostile_model_in_model_position_is_dropped(self):
+        for value in S5_HOSTILE_MODELS:
+            with self.subTest(value=value):
+                spans, counters = _s5_map("claude_code.llm_request", {
+                    "model": value,
+                    "session.id": S5_UUID_LOWER,
+                })
+                self.assertEqual(len(spans), 1)
+                self.assertOnlyAttributes(spans[0], {"session.id": S5_UUID_LOWER})
+                self.assertCounts(counters, unsafe=1)
+                bridge._validate_flat_spans(spans)
+
+    def test_hostile_tool_name_safe_path_is_dropped(self):
+        spans, counters = _s5_map("claude_code.tool", {
+            "tool_name_safe": "C:\\Users\\synthetic\\secret.txt",
+            "session.id": S5_UUID_LOWER,
+        })
+        self.assertEqual(len(spans), 1)
+        self.assertNotIn("gen_ai.tool.name", spans[0]["attributes"])
+        self.assertOnlyAttributes(spans[0], {"session.id": S5_UUID_LOWER})
+        self.assertCounts(counters, unsafe=1)
+        bridge._validate_flat_spans(spans)
+
+    def test_hostile_tool_name_alone_is_dropped(self):
+        for value in ("ghp_" + "A" * 36, "mcp__privsrv__x"):
+            with self.subTest(value=value):
+                spans, counters = _s5_map("claude_code.tool", {"tool_name": value})
+                self.assertEqual(len(spans), 1)
+                self.assertOnlyAttributes(spans[0], {})
+                self.assertCounts(counters, unsafe=1)
+                bridge._validate_flat_spans(spans)
+
+    def test_hostile_tool_call_id_jwt_is_dropped_from_both_sources(self):
+        for key in ("gen_ai.tool.call.id", "tool_use_id"):
+            with self.subTest(key=key):
+                spans, counters = _s5_map("claude_code.tool", {key: SYNTH_JWT})
+                self.assertEqual(len(spans), 1)
+                self.assertOnlyAttributes(spans[0], {})
+                self.assertCounts(counters, unsafe=1)
+                bridge._validate_flat_spans(spans)
+
+    def test_non_uuid_session_id_is_dropped_on_every_span_type(self):
+        for name in S5_TYPES:
+            with self.subTest(name=name):
+                spans, counters = _s5_map(name, {
+                    "session.id": "not-a-uuid token=SYNTH_SECRET_0001",
+                })
+                self.assertEqual(len(spans), 1)
+                self.assertOnlyAttributes(spans[0], {})
+                self.assertCounts(counters, unsafe=1)
+                bridge._validate_flat_spans(spans)
+
+    def test_hostile_token_counts_are_dropped(self):
+        for source, output_key in S5_TOKEN_SOURCES:
+            for bad in S5_BAD_COUNTS:
+                with self.subTest(source=source, bad=bad):
+                    spans, counters = _s5_map("claude_code.llm_request", {
+                        source: bad,
+                        "session.id": S5_UUID_LOWER,
+                    })
+                    self.assertEqual(len(spans), 1)
+                    self.assertOnlyAttributes(spans[0], {"session.id": S5_UUID_LOWER})
+                    self.assertNotIn(output_key, spans[0]["attributes"])
+                    self.assertCounts(counters, unsafe=1)
+                    bridge._validate_flat_spans(spans)
+
+    def test_hostile_interaction_sequence_is_dropped(self):
+        # 2**63 and 10**300 would otherwise become a turn.id longer than the
+        # bridge allows and make it refuse the whole snapshot.
+        for bad in (-1, "3", True, 2 ** 63, 10 ** 300, 1.5):
+            with self.subTest(bad=bad):
+                spans, counters = _s5_map("claude_code.interaction", {
+                    "interaction.sequence": bad,
+                    "session.id": S5_UUID_LOWER,
+                })
+                self.assertEqual(len(spans), 1)
+                self.assertOnlyAttributes(spans[0], {"session.id": S5_UUID_LOWER})
+                self.assertCounts(counters, unsafe=1)
+                bridge._validate_flat_spans(spans)
+
+    def test_tool_name_safe_shadows_tool_name(self):
+        spans, counters = _s5_map("claude_code.tool", {
+            "tool_name_safe": "C:\\Users\\synthetic\\secret.txt",
+            "tool_name": "Read",
+        })
+        self.assertEqual(len(spans), 1)
+        self.assertOnlyAttributes(spans[0], {})
+        self.assertNotIn("gen_ai.tool.name", spans[0]["attributes"])
+        self.assertCounts(counters, unmapped=1, unsafe=1)
+
+    def test_none_first_source_is_not_present_so_later_source_is_used(self):
+        spans, counters = _s5_map("claude_code.tool", {
+            "tool_name_safe": None,
+            "tool_name": "Read",
+        })
+        self.assertEqual(len(spans), 1)
+        self.assertOnlyAttributes(spans[0], {"gen_ai.tool.name": "Read"})
+        self.assertCounts(counters, unmapped=1)
+        bridge._validate_flat_spans(spans)
+
+    def test_good_llm_path_renames_and_converts_counts(self):
+        spans, counters = _s5_map("claude_code.llm_request", {
+            "session.id": S5_UUID_LOWER,
+            "gen_ai.request.model": "claude-opus-4-1-20250805",
+            "input_tokens": 12.0,
+            "output_tokens": 0,
+            "cache_read_tokens": 5,
+            "cache_creation_tokens": 7,
+        })
+        self.assertEqual(len(spans), 1)
+        self.assertOnlyAttributes(spans[0], {
+            "session.id": S5_UUID_LOWER,
+            "gen_ai.request.model": "claude-opus-4-1-20250805",
+            "gen_ai.usage.input_tokens": 12,
+            "gen_ai.usage.output_tokens": 0,
+            "gen_ai.usage.cache_read.input_tokens": 5,
+            "gen_ai.usage.cache_creation.input_tokens": 7,
+        })
+        for key in (
+            "gen_ai.usage.input_tokens",
+            "gen_ai.usage.output_tokens",
+            "gen_ai.usage.cache_read.input_tokens",
+            "gen_ai.usage.cache_creation.input_tokens",
+        ):
+            self.assertIs(type(spans[0]["attributes"][key]), int)
+        self.assertCounts(counters)
+        bridge._validate_flat_spans(spans)
+
+    def test_model_second_source_is_used_when_first_is_absent(self):
+        spans, counters = _s5_map("claude_code.llm_request", {"model": "claude-haiku-5-5"})
+        self.assertOnlyAttributes(spans[0], {"gen_ai.request.model": "claude-haiku-5-5"})
+        self.assertCounts(counters)
+
+    def test_good_tool_path_keeps_name_and_call_id(self):
+        spans, counters = _s5_map("claude_code.tool", {
+            "session.id": S5_UUID_UPPER,
+            "tool_name_safe": "Read",
+            "gen_ai.tool.call.id": "toolu_01ABCdef",
+        })
+        self.assertOnlyAttributes(spans[0], {
+            "session.id": S5_UUID_UPPER,
+            "gen_ai.tool.name": "Read",
+            "gen_ai.tool.call.id": "toolu_01ABCdef",
+        })
+        self.assertCounts(counters)
+        bridge._validate_flat_spans(spans)
+
+    def test_good_interaction_and_hook_paths(self):
+        spans, counters = _s5_map("claude_code.interaction", {
+            "session.id": S5_UUID_LOWER, "interaction.sequence": 3,
+        })
+        self.assertOnlyAttributes(spans[0], {"session.id": S5_UUID_LOWER, "turn.id": "3"})
+        self.assertCounts(counters)
+        spans, counters = _s5_map("claude_code.interaction", {"interaction.sequence": 3.0})
+        self.assertOnlyAttributes(spans[0], {"turn.id": "3"})
+        spans, counters = _s5_map("claude_code.interaction", {"interaction.sequence": 0})
+        self.assertOnlyAttributes(spans[0], {"turn.id": "0"})
+        spans, counters = _s5_map("claude_code.hook", {"session.id": S5_UUID_UPPER})
+        self.assertOnlyAttributes(spans[0], {"session.id": S5_UUID_UPPER})
+        self.assertCounts(counters)
+        bridge._validate_flat_spans(spans)
+
+    def test_constant_and_error_keys_are_never_produced_by_the_table(self):
+        for rows in _vocab.ATTRIBUTE_SOURCES.values():
+            for output_key, _sources, _kind in rows:
+                self.assertNotIn(output_key, {"agent.name", "observation.source", "error.type"})
+        spans, counters = _s5_map("claude_code.tool", {
+            "session.id": S5_UUID_LOWER, "success": False, "tool_name": "Read",
+        })
+        self.assertEqual(spans[0]["attributes"]["agent.name"], "claude-code")
+        self.assertEqual(spans[0]["attributes"]["observation.source"], "otel-export")
+        self.assertEqual(spans[0]["attributes"]["error.type"], "ToolError")
+        self.assertEqual(spans[0]["attributes"]["gen_ai.tool.name"], "Read")
+        self.assertCounts(counters)
+
+    def test_strip_keys_prefixes_and_suffixes_are_never_emitted(self):
+        keys = sorted(_vocab.STRIP_KEYS)
+        keys += [prefix + "synth_probe" for prefix in _vocab.STRIP_PREFIXES]
+        keys += ["synth_probe" + suffix for suffix in _vocab.STRIP_SUFFIXES]
+        self.assertEqual(len(set(keys)), len(keys))
+        values = S5_MARKERS[:3]
+        attributes = {key: values[index % 3] for index, key in enumerate(keys)}
+        resource = {key: values[(index + 1) % 3] for index, key in enumerate(keys)}
+        for name in S5_TYPES:
+            with self.subTest(name=name):
+                spans, counters = _s5_map(
+                    name, attributes, resource=resource, status={"code": 1},
+                )
+                self.assertEqual(len(spans), 1)
+                self.assertEqual(spans[0]["attributes"], S5_CONSTANTS)
+                self.assertCounts(counters, stripped=2 * len(keys))
+                bridge._validate_flat_spans(spans)
+                out = json.dumps(spans, ensure_ascii=True)
+                for marker in S5_MARKERS:
+                    self.assertNotIn(marker, out)
+                    self.assertNotIn(marker, repr(counters))
+
+    def test_other_source_keys_are_counted_unmapped(self):
+        spans, counters = _s5_map("claude_code.llm_request", {
+            "app.version": "1.2.3",
+            "request_id": "req-1",
+            "stop_reason": "end_turn",
+            "agent_id": "agent-1",
+            "gen_ai.system": "anthropic",
+        })
+        self.assertOnlyAttributes(spans[0], {})
+        self.assertCounts(counters, unmapped=5)
+
+    def test_success_and_decision_are_read_but_never_counted(self):
+        spans, counters = _s5_map("claude_code.tool", {
+            "success": True, "decision": "accept", "session.id": S5_UUID_LOWER,
+        })
+        self.assertOnlyAttributes(spans[0], {"session.id": S5_UUID_LOWER})
+        self.assertCounts(counters)
+        spans, counters = _s5_map("claude_code.llm_request", {
+            "success": False, "decision": "reject",
+        })
+        self.assertEqual(spans[0]["status"], {"code": 2, "message": S4_LLM_ERROR_MSG})
+        self.assertCounts(counters)
+
+    def test_resource_attributes_are_never_emitted_and_are_counted(self):
+        spans, counters = _s5_map("claude_code.llm_request", {}, resource={
+            "session.id": S5_UUID_LOWER,
+            "gen_ai.request.model": "claude-opus-4-1-20250805",
+            "user.email": "synth.user@example.test",
+            "service.name": "claude-code",
+        })
+        self.assertOnlyAttributes(spans[0], {})
+        self.assertCounts(counters, stripped=1, unmapped=3)
+
+    def test_resource_attributes_count_per_kept_span_only(self):
+        resource = {"service.name": "x"}
+        noisy = {"app.version": "1", "tool_name": "mcp__privsrv__x", "session.id": "x"}
+        kept = _rec("claude_code.llm_request", _sid(1))
+        kept["resource_attributes"] = dict(resource)
+        unknown = _rec("foo", _sid(2), attributes=noisy)
+        unknown["resource_attributes"] = dict(resource)
+        duplicate = _rec("claude_code.llm_request", _sid(1), attributes=noisy)
+        duplicate["resource_attributes"] = dict(resource)
+        bad_id = _rec("claude_code.tool", _sid(3), trace_id="0" * 31, attributes=noisy)
+        bad_id["resource_attributes"] = dict(resource)
+        kept_again = _rec("claude_code.hook", _sid(4))
+        kept_again["resource_attributes"] = dict(resource)
+        spans, counters = _map_spans([kept, unknown, duplicate, bad_id, kept_again])
+        self.assertEqual([s["spanId"] for s in spans], [_sid(1), _sid(4)])
+        self.assertCounts(counters, unmapped=2)
+
+    def test_hostile_values_in_valid_positions_never_reach_output_or_counters(self):
+        records = [
+            _rec("claude_code.llm_request", _s5_id(1), trace_id=S5_TRACE, attributes={
+                "gen_ai.request.model": "arn:aws:bedrock:us-east-1:000000000000:foundation-model/x",
+                "session.id": "not-a-uuid token=SYNTH_SECRET_0001",
+            }),
+            _rec("claude_code.tool", _s5_id(2), trace_id=S5_TRACE, attributes={
+                "tool_name_safe": "C:\\Users\\synthetic\\secret.txt",
+                "tool_name": "mcp__privsrv__x",
+                "gen_ai.tool.call.id": SYNTH_JWT,
+            }),
+            _rec("claude_code.llm_request", _s5_id(3), trace_id=S5_TRACE, attributes={
+                "model": "synth.user@example.test",
+            }),
+        ]
+        spans, counters = _map_spans(records)
+        self.assertEqual(len(spans), 3)
+        self.assertEqual(counters["unsafe_values"], 5)
+        self.assertEqual(counters["unmapped_attributes"], 4)
+        out = json.dumps(spans, ensure_ascii=True)
+        for marker in S5_MARKERS:
+            self.assertNotIn(marker, out)
+            self.assertNotIn(marker, repr(counters))
+        bridge._validate_flat_spans(spans)
 
 
 if __name__ == "__main__":
