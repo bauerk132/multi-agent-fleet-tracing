@@ -27,6 +27,7 @@ from claude_code_plugin._vocab import (  # noqa: E402
     OUTPUT_ATTRIBUTE_KEYS,
     SPAN_TYPE_TO_V1,
 )
+from claude_code_plugin import _sanitize  # noqa: E402
 from claude_code_plugin.adapter import flatten_lines  # noqa: E402
 
 
@@ -1166,6 +1167,216 @@ class InputGuardAndWhitespaceTests(unittest.TestCase):
             "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
             "stream_truncated": 0,
         })
+
+
+# M7-B step 3 S1: sanitization helpers. Hostile values are synthetic markers
+# only. The JWT is built from obviously fake parts.
+SYNTH_JWT = "eyJ" + "A" * 12 + "." + "B" * 12 + "." + "C" * 10
+
+HOSTILE_TEXT = (
+    "synth.user@example.test",
+    "sk-ant-SYNTH_SECRET_0001",
+    "Bearer SYNTH_SECRET_0001",
+    "ghp_" + "A" * 36,
+    "AKIA" + "0" * 16,
+    SYNTH_JWT,
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "C:\\Users\\synthetic\\x",
+    "/home/synthetic/.ssh/id_rsa",
+    "\\\\server\\share",
+    "token=SYNTH",
+    "password: x",
+    "A" * 257,
+    "\x1b[31m",
+    "\ud800",
+    "",
+    "Bash(rm -rf /)",
+    "text with spaces",
+    "[REDACTED]",
+)
+
+BENIGN_TEXT = (
+    "Read",
+    "Edit",
+    "Bash",
+    "WebFetch",
+    "mcp__github__get_issue",
+    "claude-opus-4-1-20250805",
+    "claude-sonnet-4-5",
+    "toolu_01ABCdef",
+    "tokenizer-v2",
+    "gen_ai.usage",
+    "Task.v2:beta",
+    "fleet@v2",
+    "x+y",
+    "session-42",
+    "v1.2.3",
+    "node:18",
+    "A",
+    "A" * 256,
+)
+
+NON_STRING_INPUTS = (None, 1, 1.5, float("nan"), b"Read", ["Read"], {"a": 1}, object())
+
+
+class Step3SanitizeTests(unittest.TestCase):
+    # S1 item (1): values copied from the bridge are equal to the bridge.
+    def test_patterns_and_flags_match_bridge(self):
+        for name in ("EMAIL_RE", "SECRET_VALUE_RE", "ABSOLUTE_PATH_RE", "SAFE_METADATA_RE"):
+            with self.subTest(name=name):
+                ours = getattr(_sanitize, name)
+                theirs = getattr(bridge, name)
+                self.assertEqual(ours.pattern, theirs.pattern)
+                self.assertEqual(ours.flags, theirs.flags)
+
+    def test_error_enums_match_bridge(self):
+        self.assertIsInstance(_sanitize.SAFE_ERROR_TYPES, frozenset)
+        self.assertIsInstance(_sanitize.SAFE_ERROR_MESSAGES, frozenset)
+        self.assertEqual(_sanitize.SAFE_ERROR_TYPES, frozenset(bridge.SAFE_ERROR_TYPES))
+        self.assertEqual(_sanitize.SAFE_ERROR_MESSAGES, frozenset(bridge.SAFE_ERROR_MESSAGES))
+        self.assertEqual(len(_sanitize.SAFE_ERROR_TYPES), 6)
+        self.assertEqual(len(_sanitize.SAFE_ERROR_MESSAGES), 4)
+
+    def test_max_chars_matches_bridge(self):
+        self.assertEqual(_sanitize.MAX_SAFE_STRING_CHARS, 256)
+        self.assertEqual(_sanitize.MAX_SAFE_STRING_CHARS, bridge.MAX_SAFE_STRING_CHARS)
+
+    def test_real_exporter_messages_and_types_are_in_sets(self):
+        # Drift guard: every message/type the bridge's real exporter emits is
+        # an approved member here, so the adapter can reuse them unchanged.
+        for kind in ("llm", "tool", "other"):
+            with self.subTest(kind=kind):
+                self.assertIn(bridge._real_exporter_error_message(kind),
+                              _sanitize.SAFE_ERROR_MESSAGES)
+                self.assertIn(bridge._real_exporter_error_type(kind),
+                              _sanitize.SAFE_ERROR_TYPES)
+
+    def test_sanitize_imports_stdlib_only(self):
+        import ast
+        source = Path(_sanitize.__file__).read_text(encoding="ascii")
+        modules = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                modules.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0, "no relative imports")
+                modules.add((node.module or "").split(".")[0])
+        self.assertLessEqual(modules, {"__future__", "math", "re"})
+        self.assertTrue(source.isascii())
+
+    # S1 item (2): hostile values are rejected, benign accepted, and the
+    # safe_text acceptance matches bridge._safe_text exactly.
+    def test_hostile_text_rejected_by_safe_text_and_bridge(self):
+        for value in HOSTILE_TEXT:
+            with self.subTest(value=repr(value)[:60]):
+                self.assertFalse(_sanitize.safe_text(value))
+                with self.assertRaises(bridge.BridgeError):
+                    bridge._safe_text(value, "synthetic")
+
+    def test_benign_text_accepted_by_safe_text_and_bridge(self):
+        for value in BENIGN_TEXT:
+            with self.subTest(value=value[:60]):
+                self.assertTrue(_sanitize.safe_text(value))
+                self.assertEqual(bridge._safe_text(value, "synthetic"), value)
+
+    def test_safe_text_matches_bridge_on_corpus(self):
+        for value in HOSTILE_TEXT + BENIGN_TEXT:
+            with self.subTest(value=repr(value)[:60]):
+                try:
+                    bridge._safe_text(value, "synthetic")
+                    bridge_accepts = True
+                except bridge.BridgeError:
+                    bridge_accepts = False
+                self.assertEqual(_sanitize.safe_text(value), bridge_accepts)
+
+    def test_safe_text_non_string_inputs_are_false(self):
+        for value in NON_STRING_INPUTS:
+            with self.subTest(value=repr(value)[:40]):
+                self.assertIs(_sanitize.safe_text(value), False)
+
+    def test_safe_text_length_boundary(self):
+        self.assertTrue(_sanitize.safe_text("A" * 256))
+        self.assertFalse(_sanitize.safe_text("A" * 257))
+
+    # S1 item (3): safe_count.
+    def test_safe_count_accepts(self):
+        self.assertEqual(_sanitize.safe_count(0), 0)
+        self.assertEqual(_sanitize.safe_count(42), 42)
+        self.assertEqual(_sanitize.safe_count(2 ** 63 - 1), 2 ** 63 - 1)
+        self.assertEqual(_sanitize.safe_count(0.0), 0)
+        self.assertIs(type(_sanitize.safe_count(12.0)), int)
+        self.assertEqual(_sanitize.safe_count(12.0), 12)
+        self.assertEqual(_sanitize.safe_count(float(2 ** 62)), 2 ** 62)
+
+    def test_safe_count_rejects(self):
+        rejected = (
+            -1, -1.0, True, False, "12", 1.5, float("nan"), float("inf"),
+            float("-inf"), None, 2 ** 63, float(2 ** 63), [], b"1",
+        )
+        for value in rejected:
+            with self.subTest(value=repr(value)[:40]):
+                self.assertIsNone(_sanitize.safe_count(value))
+
+    # S1 item (4): safe_uuid.
+    def test_safe_uuid_accepts_canonical_either_case(self):
+        self.assertTrue(_sanitize.safe_uuid("123e4567-e89b-12d3-a456-426614174000"))
+        self.assertTrue(_sanitize.safe_uuid("123E4567-E89B-12D3-A456-426614174000"))
+        self.assertTrue(_sanitize.safe_uuid("123e4567-E89B-12d3-A456-426614174000"))
+
+    def test_safe_uuid_rejects_everything_else(self):
+        rejected = (
+            "{123e4567-e89b-12d3-a456-426614174000}",
+            "123e4567-e89b-12d3-a456-42661417400",
+            "123e4567-e89b-12d3-a456-4266141740000",
+            "123e4567-e89b-12d3-a456-426614174000 token=SYNTH",
+            "123e4567-e89b-12d3-a456-426614174000\n",
+            "g23e4567-e89b-12d3-a456-426614174000",
+            "123e4567e89b12d3a456426614174000",
+            "",
+            None,
+            b"123e4567-e89b-12d3-a456-426614174000",
+        )
+        for value in rejected:
+            with self.subTest(value=repr(value)[:60]):
+                self.assertIs(_sanitize.safe_uuid(value), False)
+
+    # S1 item (5): safe_model and safe_tool_name.
+    def test_safe_model_rules(self):
+        self.assertTrue(_sanitize.safe_model("claude-opus-4-1-20250805"))
+        self.assertFalse(_sanitize.safe_model(
+            "arn:aws:bedrock:us-east-1:000000000000:foundation-model"))
+        self.assertFalse(_sanitize.safe_model(
+            "ARN:aws:bedrock:us-east-1:000000000000:foundation-model"))
+        self.assertFalse(_sanitize.safe_model("sk-ant-SYNTH_SECRET_0001"))
+        self.assertFalse(_sanitize.safe_model("A" * 257))
+        self.assertFalse(_sanitize.safe_model(""))
+        self.assertFalse(_sanitize.safe_model(None))
+
+    def test_safe_tool_name_rules(self):
+        self.assertTrue(_sanitize.safe_tool_name("Read"))
+        self.assertTrue(_sanitize.safe_tool_name("Bash"))
+        rejected = (
+            "mcp__privsrv__x",
+            "mcp__github__get_issue",
+            "C:\\Users\\synthetic\\secret.txt",
+            "ghp_" + "A" * 36,
+            "Bash(rm -rf /)",
+            "",
+            None,
+        )
+        for value in rejected:
+            with self.subTest(value=repr(value)[:60]):
+                self.assertIs(_sanitize.safe_tool_name(value), False)
+
+    def test_helpers_never_raise(self):
+        helpers = (
+            _sanitize.safe_text, _sanitize.safe_count, _sanitize.safe_uuid,
+            _sanitize.safe_model, _sanitize.safe_tool_name,
+        )
+        for helper in helpers:
+            for value in NON_STRING_INPUTS + HOSTILE_TEXT:
+                with self.subTest(helper=helper.__name__, value=repr(value)[:40]):
+                    helper(value)
 
 
 if __name__ == "__main__":
