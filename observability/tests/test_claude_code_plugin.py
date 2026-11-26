@@ -1053,5 +1053,66 @@ class RegressionGapTests(unittest.TestCase):
                     self.assertNotIn(marker, json.dumps(spans, ensure_ascii=True))
 
 
+class InputGuardAndWhitespaceTests(unittest.TestCase):
+    # ADJ-R2-P3-01: every bytes-like bare input is a caller bug, not a stream.
+    # ADJ-R2-P3-03: only RFC 8259 JSON whitespace is stripped from a line.
+
+    def test_bytearray_and_memoryview_lines_rejected(self):
+        data = _good_line().encode("utf-8")
+        for make in (bytearray, memoryview):
+            with self.subTest(kind=make.__name__):
+                with self.assertRaises(TypeError):
+                    flatten_lines(make(data))
+
+    def test_non_json_whitespace_is_not_stripped(self):
+        # json.loads rejects these leading characters, so each line is malformed.
+        for ws in ("\u00a0", "\u2028", "\u2029", "\x0b", "\x85"):
+            line = ws + _good_line()
+            with self.subTest(ws=repr(ws), kind="str"):
+                spans, counters = flatten_lines([line])
+                self.assertEqual(counters, {
+                    "lines_read": 1, "malformed_lines": 1, "spans": 0, "skipped_items": 0,
+                    "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+                    "stream_truncated": 0,
+                })
+                self.assertEqual(spans, [])
+            with self.subTest(ws=repr(ws), kind="bytes"):
+                spans, counters = flatten_lines([line.encode("utf-8")])
+                self.assertEqual(counters, {
+                    "lines_read": 1, "malformed_lines": 1, "spans": 0, "skipped_items": 0,
+                    "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+                    "stream_truncated": 0,
+                })
+                self.assertEqual(spans, [])
+
+    def test_form_feed_only_line_is_malformed(self):
+        # A form feed is not JSON whitespace: the line is read and malformed, not blank.
+        spans, counters = flatten_lines(["\x0c"])
+        self.assertEqual(spans, [])
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 1, "spans": 0, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+
+    def test_json_whitespace_still_stripped(self):
+        # Space, tab, CR and LF around a good line are stripped; a line made only
+        # of them is blank and not counted.
+        spans, counters = flatten_lines([" \t" + _good_line() + "\r\n"])
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+        spans, counters = flatten_lines([" \t\r\n"])
+        self.assertEqual(spans, [])
+        self.assertEqual(counters, {
+            "lines_read": 0, "malformed_lines": 0, "spans": 0, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+
+
 if __name__ == "__main__":
     unittest.main()

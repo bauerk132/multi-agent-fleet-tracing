@@ -208,9 +208,10 @@ def _utf8_size(text):
 def flatten_lines(lines):
     """Return ``(spans, counters)`` for the given receiver JSONL lines.
 
-    ``lines`` must be an iterable of lines. A bare ``str`` or ``bytes`` raises
-    ``TypeError`` (caller bug). Otherwise this never raises on malformed
-    content; it counts and keeps going.
+    ``lines`` must be an iterable of lines. A bare ``str``, ``bytes``,
+    ``bytearray`` or ``memoryview`` raises ``TypeError`` (caller bug).
+    Otherwise this never raises on malformed content; it counts and keeps
+    going.
 
     Each span record has: ``name``, ``traceId``, ``spanId``, ``parentSpanId``,
     ``startTimeUnixNano`` and ``endTimeUnixNano`` (int or None; the keys the
@@ -242,8 +243,10 @@ def flatten_lines(lines):
     counts as read and malformed. A ``str`` item whose UTF-8 size is over
     ``MAX_LINE_BYTES`` is oversize. An oversize line counts as read and
     malformed and is never passed to ``json.loads``; a line exactly at the
-    limit is accepted. Blank or whitespace-only text lines are skipped and not
-    counted. Parsing is strict JSON: ``NaN``, ``Infinity``,
+    limit is accepted. Blank text lines (empty, or only space, tab, CR and
+    LF, the RFC 8259 JSON whitespace) are skipped and not counted. Other
+    whitespace, such as U+00A0 or a form feed, is not stripped and makes the
+    line malformed. Parsing is strict JSON: ``NaN``, ``Infinity``,
     ``-Infinity`` and any float that is not finite (such as ``1e1000``) make
     the line malformed. ``json.loads`` failures (``ValueError``,
     ``TypeError``, ``RecursionError``) are malformed. A line that is not a
@@ -299,8 +302,10 @@ def flatten_lines(lines):
     escapes) are accepted. The check runs only on lines that contain a surrogate
     escape, so ordinary lines are not re-encoded.
     """
-    if isinstance(lines, (str, bytes)):
-        raise TypeError("flatten_lines expects an iterable of lines, not str or bytes")
+    if isinstance(lines, (str, bytes, bytearray, memoryview)):
+        raise TypeError(
+            "flatten_lines expects an iterable of lines, not str, bytes, bytearray or memoryview"
+        )
 
     spans = []
     counters = {
@@ -350,7 +355,7 @@ def flatten_lines(lines):
             continue
         if raw.startswith("\ufeff"):
             raw = raw[1:]
-        text = raw.strip()
+        text = raw.strip(" \t\r\n")
         if not text:
             continue
         counters["lines_read"] += 1
