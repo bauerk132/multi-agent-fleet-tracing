@@ -17,6 +17,8 @@ import re
 _INT64_MIN = -(2 ** 63)
 _INT64_MAX = 2 ** 63 - 1
 _INT_TEXT = re.compile(r"-?[0-9]{1,19}")
+_TIME_TEXT = re.compile(r"[0-9]{1,20}")
+_UINT64_MAX = 2 ** 64 - 1
 
 
 def _reject_constant(name):
@@ -108,6 +110,27 @@ def _read_attrs(attrs, counters):
     return decoded
 
 
+def _read_time(value, counters):
+    """Normalize a span time to a non-negative int at most 2**64 - 1.
+
+    Accepts a real int (not a bool) or an ASCII digit string. A missing or
+    ``None`` value gives ``None`` and is not counted. Any other present value
+    gives ``None`` and adds one to ``invalid_timestamps``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        number = value
+    elif isinstance(value, str) and _TIME_TEXT.fullmatch(value):
+        number = int(value)
+    else:
+        number = None
+    if number is None or not 0 <= number <= _UINT64_MAX:
+        counters["invalid_timestamps"] += 1
+        return None
+    return number
+
+
 def flatten_lines(lines):
     """Return ``(spans, counters)`` for the given receiver JSONL lines.
 
@@ -116,8 +139,15 @@ def flatten_lines(lines):
     content; it counts and keeps going.
 
     Each span record has: ``name``, ``traceId``, ``spanId``, ``parentSpanId``,
-    ``attributes`` (dict), ``resource_attributes`` (dict), ``events`` (list,
-    raw; the later mapping step drops it) and ``status`` (raw dict or None).
+    ``startTimeUnixNano`` and ``endTimeUnixNano`` (int or None; the keys the
+    agentscope mapper reads), ``attributes`` (dict), ``resource_attributes``
+    (dict), ``events`` (list, raw; the later mapping step drops it) and
+    ``status`` (raw dict or None).
+
+    Times: an int (not a bool) or an ASCII digit string at most 2**64 - 1 is
+    normalized to int. A missing or ``None`` time is None and not counted.
+    Any other present value (negative, bool, float, malformed string, too
+    large, list, dict) is None and counted once in ``invalid_timestamps``.
 
     Per-item rules: ``bytes`` items are decoded as strict UTF-8 (invalid
     UTF-8 is malformed). Any non-``str`` item after that (None, int, ...)
@@ -144,8 +174,9 @@ def flatten_lines(lines):
     entry, span attributes once per span.
 
     Counters are numbers only, never line contents: ``lines_read``
-    (non-blank lines seen), ``malformed_lines``, ``spans``, ``skipped_items``
-    and ``dropped_attributes`` (the sum of all dropped attribute items). No
+    (non-blank lines seen), ``malformed_lines``, ``spans``, ``skipped_items``,
+    ``dropped_attributes`` (the sum of all dropped attribute items) and
+    ``invalid_timestamps`` (present span time values that were rejected). No
     BOM handling happens here (a later step).
     """
     if isinstance(lines, (str, bytes)):
@@ -154,7 +185,7 @@ def flatten_lines(lines):
     spans = []
     counters = {
         "lines_read": 0, "malformed_lines": 0, "spans": 0,
-        "skipped_items": 0, "dropped_attributes": 0,
+        "skipped_items": 0, "dropped_attributes": 0, "invalid_timestamps": 0,
     }
 
     for raw in lines:
@@ -224,11 +255,15 @@ def flatten_lines(lines):
                         counters["skipped_items"] += 1
                         continue
                     span_attrs = _read_attrs(span.get("attributes"), counters)
+                    start_ns = _read_time(span.get("startTimeUnixNano"), counters)
+                    end_ns = _read_time(span.get("endTimeUnixNano"), counters)
                     spans.append({
                         "name": span.get("name"),
                         "traceId": span.get("traceId"),
                         "spanId": span.get("spanId"),
                         "parentSpanId": span.get("parentSpanId"),
+                        "startTimeUnixNano": start_ns,
+                        "endTimeUnixNano": end_ns,
                         "attributes": span_attrs,
                         "resource_attributes": resource_attrs,
                         "events": span.get("events") if isinstance(span.get("events"), list) else [],

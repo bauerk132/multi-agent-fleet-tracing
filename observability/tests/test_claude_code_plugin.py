@@ -14,7 +14,7 @@ from pathlib import Path
 sys_path = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, sys_path)
 
-from agentscope_importer import bridge  # noqa: E402
+from agentscope_importer import bridge, mapper  # noqa: E402
 from claude_code_plugin._vocab import (  # noqa: E402
     OUTPUT_ATTRIBUTE_KEYS,
     SPAN_TYPE_TO_V1,
@@ -102,7 +102,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
 
         self.assertEqual(counters, {
             "lines_read": 5, "malformed_lines": 3, "spans": 2, "skipped_items": 0,
-            "dropped_attributes": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0,
         })
         self.assertEqual(len(spans), 2)
         self.assertEqual(spans[0]["name"], "claude_code.interaction")
@@ -126,7 +126,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
                 spans, counters = flatten_lines([bad, _good_line()])
                 self.assertEqual(counters, {
                     "lines_read": 2, "malformed_lines": 0, "spans": 2, "skipped_items": 1,
-                    "dropped_attributes": 0,
+                    "dropped_attributes": 0, "invalid_timestamps": 0,
                 })
                 self.assertEqual(spans[0]["resource_attributes"], {})
                 self.assertEqual(spans[1]["resource_attributes"]["service.name"], "claude-code")
@@ -142,7 +142,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         spans, counters = flatten_lines(bad_lines + [_good_line()])
         self.assertEqual(counters, {
             "lines_read": 5, "malformed_lines": 0, "spans": 1, "skipped_items": 4,
-            "dropped_attributes": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0,
         })
         self.assertEqual(len(spans), 1)
 
@@ -152,7 +152,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         spans, counters = flatten_lines([line, _good_line()])
         self.assertEqual(counters, {
             "lines_read": 2, "malformed_lines": 0, "spans": 1, "skipped_items": 3,
-            "dropped_attributes": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0,
         })
         self.assertEqual(len(spans), 1)
 
@@ -176,7 +176,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         spans, counters = flatten_lines([line])
         self.assertEqual(counters, {
             "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 4,
-            "dropped_attributes": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0,
         })
         self.assertEqual(len(spans), 1)
         for span in spans:
@@ -189,7 +189,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         spans, counters = flatten_lines([_good_line(), deep, _good_line()])
         self.assertEqual(counters, {
             "lines_read": 3, "malformed_lines": 1, "spans": 2, "skipped_items": 0,
-            "dropped_attributes": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0,
         })
         self.assertEqual(len(spans), 2)
 
@@ -198,7 +198,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         spans, counters = flatten_lines([_good_line(), None, 123, _good_line()])
         self.assertEqual(counters, {
             "lines_read": 4, "malformed_lines": 2, "spans": 2, "skipped_items": 0,
-            "dropped_attributes": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0,
         })
         self.assertEqual(len(spans), 2)
 
@@ -211,7 +211,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         ])
         self.assertEqual(counters, {
             "lines_read": 3, "malformed_lines": 1, "spans": 2, "skipped_items": 0,
-            "dropped_attributes": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0,
         })
         self.assertEqual(len(spans), 2)
 
@@ -229,7 +229,7 @@ class FlattenMalformedLinesTests(unittest.TestCase):
         spans, counters = flatten_lines([_good_line()] + bad_lines + [_good_line()])
         self.assertEqual(counters, {
             "lines_read": 6, "malformed_lines": 4, "spans": 2, "skipped_items": 0,
-            "dropped_attributes": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0,
         })
         self.assertEqual(len(spans), 2)
 
@@ -278,7 +278,7 @@ class StrictAnyValueTests(unittest.TestCase):
         spans, counters = flatten_lines([_line([{"resource": {}, "scopeSpans": [{"spans": [span]}]}])])
         self.assertEqual(counters, {
             "lines_read": 1, "malformed_lines": 0, "spans": 1, "skipped_items": 0,
-            "dropped_attributes": 12,
+            "dropped_attributes": 12, "invalid_timestamps": 0,
         })
         self.assertEqual(spans[0]["attributes"], {
             "a.str": "ok",
@@ -306,7 +306,7 @@ class StrictAnyValueTests(unittest.TestCase):
         spans, counters = flatten_lines([line])
         self.assertEqual(counters, {
             "lines_read": 1, "malformed_lines": 0, "spans": 3, "skipped_items": 3,
-            "dropped_attributes": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0,
         })
         self.assertEqual(len(spans), 3)
         for span in spans:
@@ -325,9 +325,84 @@ class StrictAnyValueTests(unittest.TestCase):
         spans, counters = flatten_lines([line])
         self.assertEqual(counters, {
             "lines_read": 1, "malformed_lines": 0, "spans": 2, "skipped_items": 0,
-            "dropped_attributes": 1,
+            "dropped_attributes": 1, "invalid_timestamps": 0,
         })
         self.assertEqual(spans[0]["resource_attributes"], {"service.name": "claude-code"})
+
+
+def _timed_span(span_id, parent_id="", **times):
+    span = _span()
+    span["spanId"] = span_id
+    span["parentSpanId"] = parent_id
+    span.update(times)
+    return span
+
+
+class FlattenTimestampTests(unittest.TestCase):
+    def test_timestamps_kept_and_parent_ordered_first(self):
+        # Child listed first, parent second. Times are digit strings; flatten
+        # must keep them as ints under the bridge/mapper key names, so the
+        # mapper orders the parent (start 1000) before the child (start 2000).
+        child = _timed_span("11" * 8, "ff" * 8, startTimeUnixNano="2000", endTimeUnixNano="3000")
+        parent = _timed_span("ff" * 8, "", startTimeUnixNano="1000", endTimeUnixNano="9000")
+        line = _line([{"resource": {}, "scopeSpans": [{"spans": [child, parent]}]}])
+
+        spans, _counters = flatten_lines([line])
+        by_id = {span["spanId"]: span for span in spans}
+        self.assertEqual(by_id["ff" * 8]["startTimeUnixNano"], 1000)
+        self.assertEqual(by_id["ff" * 8]["endTimeUnixNano"], 9000)
+        self.assertEqual(by_id["11" * 8]["startTimeUnixNano"], 2000)
+        self.assertEqual(by_id["11" * 8]["endTimeUnixNano"], 3000)
+        self.assertIs(type(by_id["11" * 8]["startTimeUnixNano"]), int)
+
+        # Flatten record fed straight into mapper.map_trace (same span dict
+        # shape; no adaptation needed).
+        document, _notes, dropped = mapper.map_trace("a" * 32, spans, "claude-code")
+        self.assertIsNone(dropped)
+        by_native = {span["native_id"]: span for span in document["spans"]}
+        parent_doc = by_native["ff" * 8]
+        child_doc = by_native["11" * 8]
+        self.assertEqual(parent_doc["seq"], 0)
+        self.assertLess(parent_doc["seq"], child_doc["seq"])
+        self.assertEqual(child_doc["parent_native_id"], "ff" * 8)
+        self.assertIsNotNone(parent_doc["started_at"])
+        self.assertIsNotNone(child_doc["started_at"])
+        self.assertAlmostEqual(parent_doc["duration_ms"], 0.008)
+        self.assertAlmostEqual(child_doc["duration_ms"], 0.001)
+
+    def test_invalid_timestamp_set_none_and_counted(self):
+        # One bad start value per span: each is None and counted once.
+        bad_values = [-1, True, 1.5, "12x", "", 2 ** 64, [1], {}]
+        bad_spans = [
+            _timed_span("%016x" % (index + 1), "", startTimeUnixNano=value)
+            for index, value in enumerate(bad_values)
+        ]
+        missing = _timed_span("c" * 16, "")  # no time keys at all: not counted
+        int_five = _timed_span("d" * 16, "", startTimeUnixNano=5)
+        str_five = _timed_span("e" * 16, "", startTimeUnixNano="5")
+        max_valid = _timed_span("f" * 16, "", startTimeUnixNano="18446744073709551615")
+        line = _line([{
+            "resource": {},
+            "scopeSpans": [{"spans": bad_spans + [missing, int_five, str_five, max_valid]}],
+        }])
+
+        spans, counters = flatten_lines([line])
+        self.assertEqual(counters, {
+            "lines_read": 1, "malformed_lines": 0, "spans": 12, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 8,
+        })
+        by_id = {span["spanId"]: span for span in spans}
+        for index in range(len(bad_values)):
+            span = by_id["%016x" % (index + 1)]
+            self.assertIsNone(span["startTimeUnixNano"], f"bad value {bad_values[index]!r}")
+            self.assertIsNone(span["endTimeUnixNano"])
+        self.assertIsNone(by_id["c" * 16]["startTimeUnixNano"])
+        self.assertIsNone(by_id["c" * 16]["endTimeUnixNano"])
+        self.assertEqual(by_id["d" * 16]["startTimeUnixNano"], 5)
+        self.assertIs(type(by_id["d" * 16]["startTimeUnixNano"]), int)
+        self.assertEqual(by_id["e" * 16]["startTimeUnixNano"], 5)
+        self.assertIs(type(by_id["e" * 16]["startTimeUnixNano"]), int)
+        self.assertEqual(by_id["f" * 16]["startTimeUnixNano"], 2 ** 64 - 1)
 
 
 if __name__ == "__main__":
