@@ -12,8 +12,13 @@ observability/:
     python -m unittest tests.test_claude_code_plugin -v
 """
 
+import contextlib
+import io
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2990,6 +2995,141 @@ class Step3RoundTripTests(unittest.TestCase):
             spans, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
         ).encode("ascii")
         self.assertEqual(raw, expected)
+
+
+def _s9_cli():
+    from claude_code_plugin import cli
+    return cli
+
+
+class Step3CliTests(unittest.TestCase):
+    """M7-B step 3 S9: the convert CLI (D11). Output and errors go to stdout as JSON."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.in_path = self.dir / "in.jsonl"
+        self.out_path = self.dir / "out.json"
+        self.in_path.write_bytes(("\n".join(_s8_lines()) + "\n").encode("ascii"))
+
+    def _run(self, argv=None):
+        cli = _s9_cli()
+        if argv is None:
+            argv = ["convert", str(self.in_path), "--out", str(self.out_path)]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.main(argv)
+        return code, buf.getvalue()
+
+    def _names(self):
+        return sorted(os.listdir(self.dir))
+
+    def _assert_clean(self, stdout):
+        for text in (str(self.in_path), str(self.out_path), str(self.dir), self._tmp.name):
+            self.assertNotIn(text, stdout)
+        for marker in S8_MARKERS:
+            self.assertNotIn(marker, stdout, marker)
+
+    def test_success_writes_bridge_readable_spans(self):
+        from claude_code_plugin import mapping
+        code, _stdout = self._run()
+        self.assertEqual(code, 0)
+        raw = self.out_path.read_bytes()
+        kind, _parsed, documents, _normalization = bridge._parse_source_snapshot(raw, "claude-code")
+        self.assertEqual(kind, "spans")
+        self.assertTrue(documents)
+        for document in documents:
+            bridge.validate_artifact(document, mapper.canonical_bytes(document))
+        spans, _counters = mapping.convert_lines(_s8_lines())
+        self.assertEqual(raw, mapping.serialize(spans))
+        self.assertEqual(self._names(), ["in.jsonl", "out.json"])
+
+    def test_success_stdout_is_one_json_object_of_ints(self):
+        code, stdout = self._run()
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.count("\n"), 1)
+        data = json.loads(stdout)
+        self.assertEqual(set(data), set(S8_MERGED_KEYS) | {"spans_written"})
+        for key, value in data.items():
+            self.assertIs(type(value), int, key)
+        self.assertEqual(data["spans_written"], len(json.loads(self.out_path.read_bytes())))
+        self._assert_clean(stdout)
+
+    def test_existing_output_refused_and_unchanged(self):
+        self.out_path.write_bytes(b"ORIGINAL")
+        code, stdout = self._run()
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(stdout), {"error": "output_exists"})
+        self.assertEqual(self.out_path.read_bytes(), b"ORIGINAL")
+        self.assertEqual(self._names(), ["in.jsonl", "out.json"])
+        self._assert_clean(stdout)
+
+    def test_oversize_input_refused_without_output(self):
+        size = self.in_path.stat().st_size
+        with mock.patch.object(adapter_module, "MAX_TOTAL_BYTES", size - 1):
+            code, stdout = self._run()
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(stdout), {"error": "input_too_large"})
+        self.assertEqual(self._names(), ["in.jsonl"])
+        self._assert_clean(stdout)
+
+    def test_input_exactly_at_limit_is_accepted(self):
+        size = self.in_path.stat().st_size
+        with mock.patch.object(adapter_module, "MAX_TOTAL_BYTES", size):
+            code, _stdout = self._run()
+        self.assertEqual(code, 0)
+        self.assertTrue(self.out_path.exists())
+
+    def test_zero_spans_exit_one_without_output(self):
+        unknown = _s8_line([_s8_span("foreign.span", S8_FOREIGN)])
+        self.in_path.write_bytes(b"not json\n" + unknown.encode("ascii") + b"\n")
+        code, stdout = self._run()
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(stdout), {"error": "no_spans"})
+        self.assertEqual(self._names(), ["in.jsonl"])
+        self._assert_clean(stdout)
+
+    def test_output_too_large_refused_without_output(self):
+        cli = _s9_cli()
+        with mock.patch.object(cli, "MAX_OUTPUT_BYTES", 16):
+            code, stdout = self._run()
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(stdout), {"error": "output_too_large"})
+        self.assertEqual(self._names(), ["in.jsonl"])
+        self._assert_clean(stdout)
+
+    def test_missing_input_is_unreadable(self):
+        missing = self.dir / "missing.jsonl"
+        code, stdout = self._run(["convert", str(missing), "--out", str(self.out_path)])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(stdout), {"error": "input_unreadable"})
+        self.assertEqual(self._names(), ["in.jsonl"])
+        self._assert_clean(stdout)
+
+    def test_failed_replace_refused_and_temp_removed(self):
+        cli = _s9_cli()
+        with mock.patch.object(cli.os, "replace", side_effect=OSError("denied")):
+            code, stdout = self._run()
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(stdout), {"error": "output_unwritable"})
+        self.assertEqual(self._names(), ["in.jsonl"])
+        self._assert_clean(stdout)
+
+    def test_module_entry_point_end_to_end(self):
+        obs = Path(__file__).resolve().parent.parent
+        proc = subprocess.run(
+            [sys.executable, "-B", "-m", "claude_code_plugin", "convert",
+             str(self.in_path), "--out", str(self.out_path)],
+            cwd=str(obs), capture_output=True, timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, b"")
+        kind, _parsed, _documents, _normalization = bridge._parse_source_snapshot(
+            self.out_path.read_bytes(), "claude-code")
+        self.assertEqual(kind, "spans")
+        self.assertGreater(json.loads(proc.stdout)["spans_written"], 0)
+        self.assertEqual(self._names(), ["in.jsonl", "out.json"])
 
 
 if __name__ == "__main__":
