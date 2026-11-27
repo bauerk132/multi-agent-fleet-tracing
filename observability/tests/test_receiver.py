@@ -5,6 +5,28 @@ from unittest.mock import patch
 from receiver import LocalReceiver
 
 
+def _receive_response(sock):
+    data = bytearray()
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+    header, body = bytes(data).split(b"\r\n\r\n", 1)
+    declared = 0
+    for line in header.split(b"\r\n")[1:]:
+        if line.lower().startswith(b"content-length:"):
+            declared = int(line.split(b":", 1)[1].strip())
+            break
+    data = bytearray(body)
+    while len(data) < declared:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data.extend(chunk)
+    return header + b"\r\n\r\n" + bytes(data)
+
+
 class ReceiverBodyBoundsTests(unittest.TestCase):
     def setUp(self):
         self.receiver = LocalReceiver().start()
@@ -19,8 +41,7 @@ class ReceiverBodyBoundsTests(unittest.TestCase):
             lines = ["POST /v1/traces HTTP/1.1", "Host: 127.0.0.1"]
             lines.extend(headers)
             sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body)
-            response = sock.recv(4096)
-            return response.split(b"\r\n", 1)[0]
+            return _receive_response(sock).split(b"\r\n", 1)[0]
         finally:
             sock.close()
 
@@ -31,13 +52,7 @@ class ReceiverBodyBoundsTests(unittest.TestCase):
             lines = ["POST /v1/traces HTTP/1.1", "Host: 127.0.0.1"]
             lines.extend(headers)
             sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
-            response = bytearray()
-            while b"\r\n\r\n" not in response:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                response.extend(chunk)
-            return bytes(response).split(b"\r\n", 1)[0]
+            return _receive_response(sock).split(b"\r\n", 1)[0]
         finally:
             sock.close()
 
@@ -100,11 +115,72 @@ class ReceiverBodyBoundsTests(unittest.TestCase):
                 "POST /v1/traces HTTP/1.1\r\nHost: localhost\r\n"
                 "Content-Length: 16777217\r\nExpect: 100-continue\r\n\r\n"
             ).encode("ascii"))
-            response = bytearray()
-            while b"\r\n\r\n" not in response:
-                response.extend(sock.recv(4096))
+            response = _receive_response(sock)
             self.assertNotIn(b"100 Continue", response)
             self.assertIn(b" 413 ", response)
+        finally:
+            sock.close()
+
+
+class ReceiverEncodingTests(unittest.TestCase):
+    def setUp(self):
+        self.receiver = LocalReceiver().start()
+
+    def tearDown(self):
+        self.receiver.stop()
+
+    def _send(self, headers, body=b'{"resourceSpans": []}', declared_length=None):
+        sock = socket.create_connection(("127.0.0.1", self.receiver.port), timeout=2)
+        sock.settimeout(2)
+        try:
+            lines = ["POST /v1/traces HTTP/1.1", "Host: localhost", "Content-Type: application/json"]
+            lines.extend(headers)
+            length = len(body) if declared_length is None else declared_length
+            lines.append(f"Content-Length: {length}")
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + (body or b""))
+            return _receive_response(sock).split(b"\r\n", 1)[0]
+        finally:
+            sock.close()
+
+    def test_absent_encoding_accepts_valid_json(self):
+        self.assertIn(b" 200 ", self._send([]))
+
+    def test_identity_encoding_is_case_insensitive(self):
+        self.assertIn(b" 200 ", self._send(["Content-Encoding: IdEnTiTy"]))
+
+    def test_gzip_is_rejected_before_reading_body(self):
+        self.assertIn(b" 415 ", self._send(["Content-Encoding: gzip"], body=None, declared_length=128))
+
+    def test_unknown_encoding_is_rejected_before_reading_body(self):
+        self.assertIn(b" 415 ", self._send(["Content-Encoding: compress"], body=None, declared_length=128))
+
+    def test_repeated_encoding_is_rejected_before_reading_body(self):
+        self.assertIn(b" 415 ", self._send([
+            "Content-Encoding: identity", "Content-Encoding: gzip"
+        ], body=None, declared_length=128))
+
+    def test_blank_encoding_is_rejected_before_reading_body(self):
+        self.assertIn(b" 415 ", self._send(["Content-Encoding:"], body=None, declared_length=128))
+
+    def test_persistent_connection_revalidates_each_post(self):
+        sock = socket.create_connection(("127.0.0.1", self.receiver.port), timeout=2)
+        sock.settimeout(2)
+        try:
+            body = b'{"resourceSpans": []}'
+            first = ("POST /v1/traces HTTP/1.1\r\nHost: localhost\r\n"
+                     "Content-Type: application/json\r\n"
+                     f"Content-Length: {len(body)}\r\n\r\n").encode("ascii") + body
+            sock.sendall(first)
+            data = bytearray()
+            while b"\r\n\r\n" not in data:
+                data.extend(sock.recv(4096))
+            header, rest = bytes(data).split(b"\r\n\r\n", 1)
+            while len(rest) < 2:
+                rest += sock.recv(4096)
+            self.assertIn(b" 200 ", header.split(b"\r\n", 1)[0])
+            sock.sendall(b"POST /v1/traces HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            response = sock.recv(4096)
+            self.assertIn(b" 411 ", response)
         finally:
             sock.close()
 
