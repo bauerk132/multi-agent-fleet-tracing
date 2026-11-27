@@ -149,7 +149,7 @@ def main(argv=None):
     p_deliver.add_argument("--synthetic-only", action="store_true",
                            help="acknowledge the snapshot is synthetic-only test data (required unless --live)")
     p_deliver.add_argument("--live", action="store_true",
-                           help="acknowledge the snapshot is a real Copilot observation (required unless --synthetic-only)")
+                           help="acknowledge the snapshot is a real Copilot or Claude Code observation (required unless --synthetic-only)")
     p_deliver.add_argument("--data-dir", dest="deliver_data_dir", default=None)
     p_deliver.set_defaults(func=_cmd_deliver)
 

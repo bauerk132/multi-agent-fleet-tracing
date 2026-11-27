@@ -1823,6 +1823,25 @@ def _import_input(raw, parsed, source_kind, live, normalization):
     return json.dumps(normalized_spans, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def _check_live_claude_code_spans(source_kind, parsed):
+    """Refuse live Claude Code input unless it is the adapter's span array.
+
+    Only the claude_code_plugin adapter's JSON array of flat spans is
+    accepted. Every span must carry agent.name "claude-code" and
+    observation.source "otel-export". Attribute values are never echoed.
+    """
+    if source_kind != "spans":
+        raise BridgeError("live Claude Code input must be the adapter's JSON span array; run `python -m claude_code_plugin convert` first")
+    if not parsed:
+        raise BridgeError("live Claude Code input contains no spans")
+    for span in parsed:
+        attributes = span.get("attributes") if isinstance(span, dict) else None
+        if (not isinstance(attributes, dict)
+                or attributes.get("agent.name") != "claude-code"
+                or attributes.get("observation.source") != "otel-export"):
+            raise BridgeError("live Claude Code spans must carry agent.name claude-code and observation.source otel-export")
+
+
 def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synthetic_only=False, live=False):
     """Validate, locally import, then deliver the same bounded source snapshot.
 
@@ -1830,17 +1849,23 @@ def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synth
     no later source-file read can change the artifact after validation.
 
     Exactly one acknowledgment is required: `synthetic_only=True` for
-    synthetic test data, or `live=True` for real Copilot observations.
-    Live delivery accepts only producer "copilot" and normalizes raw
-    Copilot exporter spans (name mapping, attribute sanitizing) before
-    validation; it never passes real observations with a synthetic-only
+    synthetic test data, or `live=True` for real Copilot or Claude Code
+    observations. Live delivery accepts only producers "copilot" and
+    "claude-code". Live Copilot delivery normalizes raw Copilot exporter
+    spans (name mapping, attribute sanitizing) before validation. Live
+    Claude Code delivery applies no normalization: the input must be the
+    claude_code_plugin adapter's JSON span array (`python -m
+    claude_code_plugin convert`), non-empty, with every span's agent.name
+    "claude-code" and observation.source "otel-export"; any other shape is
+    refused before import or delivery. Every document's producer must equal
+    the requested producer. Live delivery never accepts a synthetic-only
     acknowledgment.
     """
     if live and synthetic_only:
         raise BridgeError("live and synthetic-only acknowledgments conflict; pass exactly one")
     if live:
-        if producer != "copilot":
-            raise BridgeError("live delivery accepts Copilot observations only (producer must be copilot)")
+        if producer not in ("copilot", "claude-code"):
+            raise BridgeError("live delivery accepts Copilot or Claude Code observations only (producer must be copilot or claude-code)")
         mode = "live"
     elif synthetic_only:
         mode = "synthetic"
@@ -1855,14 +1880,18 @@ def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synth
         raise BridgeError("AgentScope token is missing or malformed", "authentication_failed")
     settings = settings or ImportSettings()
     try:
-        source_kind, parsed, documents, normalization = _parse_source_snapshot(raw, producer, live=live)
+        source_kind, parsed, documents, normalization = _parse_source_snapshot(
+            raw, producer, live=live and producer == "copilot"
+        )
+        if live and producer == "claude-code":
+            _check_live_claude_code_spans(source_kind, parsed)
         for document in documents:
             document_bytes = canonical_bytes(document)
             validate_artifact(document, document_bytes, settings.max_bytes_per_import)
         if live:
             for document in documents:
-                if document["run"]["metadata"]["producer"] != "copilot":
-                    raise BridgeError("live delivery accepts Copilot observations only (producer must be copilot)")
+                if document["run"]["metadata"]["producer"] != producer:
+                    raise BridgeError("live delivery document producer must match the requested producer")
     except BridgeError:
         raise
     except (ValueError, TypeError, OverflowError, UnicodeError, RecursionError):
