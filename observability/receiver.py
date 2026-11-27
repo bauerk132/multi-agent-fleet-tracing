@@ -22,9 +22,13 @@ Usage in-process (tests):
 from __future__ import annotations
 
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+
+MAX_BODY_BYTES = 16 * 1024 * 1024
 
 
 def _attrs_to_dict(attrs):
@@ -142,32 +146,84 @@ class LocalReceiver:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _record_rejection(self, length, reason):
+                with receiver._lock:
+                    receiver.rejected.append({
+                        "content_type": None,
+                        "length": length,
+                        "encoding": None,
+                        "reason": reason,
+                    })
+
+            def _refuse(self, code, reason, length=None):
+                self.close_connection = True
+                self._record_rejection(length, reason)
+                self._send_json(code, {"error": reason})
+                return False
+
+            def _preflight(self):
+                """Validate HTTP framing before any request body read."""
+                transfer_encoding = self.headers.get_all("Transfer-Encoding", [])
+                if transfer_encoding:
+                    return self._refuse(411, "unsupported_transfer_encoding")
+
+                values = self.headers.get_all("Content-Length", [])
+                if not values:
+                    return self._refuse(411, "length_required")
+                if len(values) != 1:
+                    return self._refuse(411, "invalid_length")
+
+                raw_length = values[0].strip(" \t")
+                if not raw_length or re.fullmatch(r"[0-9]+", raw_length, flags=re.ASCII) is None:
+                    return self._refuse(411, "invalid_length")
+                significant = raw_length.lstrip("0") or "0"
+                if len(significant) > len(str(MAX_BODY_BYTES)) or (
+                    len(significant) == len(str(MAX_BODY_BYTES))
+                    and significant > str(MAX_BODY_BYTES)
+                ):
+                    return self._refuse(413, "body_too_large")
+                length = int(significant)
+                self._validated_length = length
+                return True
+
+            def handle_expect_100(self):
+                if self.path != "/v1/traces":
+                    self.close_connection = True
+                    self._send_json(404, {"error": "not found"})
+                    return False
+                self._preflight_done = True
+                self._preflight_accepted = self._preflight()
+                if not self._preflight_accepted:
+                    return False
+                self.send_response_only(100)
+                self.end_headers()
+                return True
+
             def do_POST(self):
                 if self.path != "/v1/traces":
+                    self.close_connection = True
                     self._send_json(404, {"error": "not found"})
                     return
-                length = int(self.headers.get("Content-Length") or 0)
+                if not getattr(self, "_preflight_done", False):
+                    self._preflight_done = True
+                    self._preflight_accepted = self._preflight()
+                if not self._preflight_accepted:
+                    return
+                length = self._validated_length
                 raw = self.rfile.read(length) if length else b""
+                if len(raw) != length:
+                    self._refuse(400, "incomplete_body", length)
+                    return
                 try:
                     payload = json.loads(raw.decode("utf-8"))
                 except (ValueError, UnicodeDecodeError):
-                    with receiver._lock:
-                        receiver.rejected.append(
-                            {
-                                "content_type": self.headers.get("Content-Type"),
-                                "length": length,
-                            }
-                        )
+                    self._record_rejection(length, "invalid_json")
+                    self.close_connection = True
                     self._send_json(400, {"error": "invalid JSON"})
                     return
                 if not isinstance(payload, dict) or "resourceSpans" not in payload:
-                    with receiver._lock:
-                        receiver.rejected.append(
-                            {
-                                "content_type": self.headers.get("Content-Type"),
-                                "length": length,
-                            }
-                        )
+                    self._record_rejection(length, "invalid_payload")
+                    self.close_connection = True
                     self._send_json(400, {"error": "not an OTLP traces payload"})
                     return
                 receiver._handle_payload(payload)
