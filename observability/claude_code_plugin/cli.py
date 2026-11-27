@@ -2,6 +2,7 @@
 
 Usage (run from the observability/ directory):
   python -m claude_code_plugin convert <in.jsonl> --out <out.json>
+  python -m claude_code_plugin env --endpoint http://127.0.0.1:4318/v1/traces
 
 convert reads a receiver JSONL file (one OTLP/JSON resourceSpans object per
 line), maps it with mapping.convert_lines, and writes the canonical flat span
@@ -24,7 +25,8 @@ prints the merged counters (all ints) plus spans_written and exits 0. A refusal
 prints {"error": "<code>"}. Nothing printed ever contains the input path, the
 output path, the temp directory, or any input content. Tracebacks are not
 printed for these cases. argparse usage errors go to stderr as argparse always
-prints them.
+prints them. The env command only prints a validated PowerShell block; it does
+not change the current environment, write files, or make network requests.
 
 The write is atomic: a temp file in the output directory is written, flushed
 and fsynced, then os.replace'd onto the output path. The temp file is removed
@@ -41,8 +43,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
+import unicodedata
+from urllib.parse import urlsplit
 
 # Allow `python -m claude_code_plugin` from the observability directory.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -57,6 +62,101 @@ MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 EXIT_OK = 0
 EXIT_NO_SPANS = 1
 EXIT_REFUSED = 2
+
+ENV_WARNING_NAMES = (
+    "OTEL_LOG_USER_PROMPTS",
+    "OTEL_LOG_TOOL_DETAILS",
+    "OTEL_LOG_TOOL_CONTENT",
+    "OTEL_LOG_ASSISTANT_RESPONSES",
+    "OTEL_LOG_RAW_API_BODIES",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+)
+
+
+def _fixed_env_error(parser):
+    parser.exit(EXIT_REFUSED, "error: invalid env arguments\n")
+
+
+class _Subparser(argparse.ArgumentParser):
+    fixed_errors = False
+
+    def error(self, message):
+        if self.fixed_errors:
+            _fixed_env_error(self)
+        super().error(message)
+
+
+class _MainParser(_Subparser):
+    def parse_args(self, args=None, namespace=None):
+        values = list(sys.argv[1:] if args is None else args)
+        self.env_mode = bool(values and values[0] == "env")
+        return super().parse_args(values, namespace)
+
+    def error(self, message):
+        if getattr(self, "env_mode", False):
+            _fixed_env_error(self)
+        super().error(message)
+
+
+def _validated_env_endpoint(value):
+    if not isinstance(value, str) or any(
+        char.isspace() or unicodedata.category(char) == "Cc" for char in value
+    ):
+        raise ValueError("invalid endpoint")
+    if "?" in value or "#" in value or "\\" in value:
+        raise ValueError("invalid endpoint")
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        raise ValueError("invalid endpoint") from None
+    if parts.scheme.lower() != "http" or parts.path != "/v1/traces":
+        raise ValueError("invalid endpoint")
+    if (
+        not parts.netloc
+        or "@" in parts.netloc
+        or parts.username is not None
+        or parts.password is not None
+    ):
+        raise ValueError("invalid endpoint")
+
+    hostname = parts.hostname
+    if hostname not in ("127.0.0.1", "::1", "localhost"):
+        raise ValueError("invalid endpoint")
+    if hostname == "::1":
+        match = re.fullmatch(r"\[::1\]:([0-9]+)", parts.netloc, flags=re.IGNORECASE)
+    else:
+        match = re.fullmatch(
+            r"(127\.0\.0\.1|localhost):([0-9]+)",
+            parts.netloc,
+            flags=re.IGNORECASE,
+        )
+    if match is None:
+        raise ValueError("invalid endpoint")
+    port_text = match.group(1 if hostname == "::1" else 2)
+    significant = port_text.lstrip("0") or "0"
+    if len(significant) > 5 or significant == "0":
+        raise ValueError("invalid endpoint")
+    port = int(significant)
+    if port > 65535:
+        raise ValueError("invalid endpoint")
+    display_host = f"[{hostname}]" if hostname == "::1" else hostname
+    return f"http://{display_host}:{port}/v1/traces"
+
+
+def _print_env_block(endpoint):
+    lines = (
+        "$env:CLAUDE_CODE_ENABLE_TELEMETRY = '1'",
+        "$env:CLAUDE_CODE_ENHANCED_TELEMETRY_BETA = '1'",
+        "$env:OTEL_TRACES_EXPORTER = 'otlp'",
+        "$env:OTEL_METRICS_EXPORTER = 'none'",
+        "$env:OTEL_LOGS_EXPORTER = 'none'",
+        "$env:OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'http/json'",
+        f"$env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = '{endpoint}'",
+    )
+    print("\n".join(lines))
+    for name in ENV_WARNING_NAMES:
+        if name in os.environ:
+            print(f"warning: {name} is set; review telemetry settings", file=sys.stderr)
 
 
 class _Refusal(Exception):
@@ -133,17 +233,30 @@ def _convert(in_path, out_path):
 
 def main(argv=None):
     """Run the CLI and return the exit code (0 ok, 1 no spans, 2 refused)."""
-    parser = argparse.ArgumentParser(prog="claude_code_plugin")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser = _MainParser(prog="claude_code_plugin")
+    sub = parser.add_subparsers(dest="command", required=True, parser_class=_Subparser)
     p_convert = sub.add_parser(
         "convert", help="convert a receiver JSONL file to a bridge-ready span array",
     )
     p_convert.add_argument("input")
     p_convert.add_argument("--out", required=True)
+    p_env = sub.add_parser(
+        "env", help="print a traces-only telemetry environment block"
+    )
+    p_env.add_argument("--endpoint", required=True)
+    p_env.fixed_errors = True
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else EXIT_REFUSED
+    if args.command == "env":
+        try:
+            endpoint = _validated_env_endpoint(args.endpoint)
+        except ValueError:
+            print("error: invalid env arguments", file=sys.stderr)
+            return EXIT_REFUSED
+        _print_env_block(endpoint)
+        return EXIT_OK
     try:
         return _convert(args.input, args.out)
     except _Refusal as refusal:

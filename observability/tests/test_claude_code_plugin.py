@@ -3851,5 +3851,125 @@ class Step3CliTests(unittest.TestCase):
         self.assertEqual(self._names(), ["in.jsonl", "out.json"])
 
 
+class Step4EnvCliTests(unittest.TestCase):
+    ASSIGNMENTS = (
+        "$env:CLAUDE_CODE_ENABLE_TELEMETRY = '1'\n"
+        "$env:CLAUDE_CODE_ENHANCED_TELEMETRY_BETA = '1'\n"
+        "$env:OTEL_TRACES_EXPORTER = 'otlp'\n"
+        "$env:OTEL_METRICS_EXPORTER = 'none'\n"
+        "$env:OTEL_LOGS_EXPORTER = 'none'\n"
+        "$env:OTEL_EXPORTER_OTLP_TRACES_PROTOCOL = 'http/json'\n"
+        "$env:OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'http://127.0.0.1:4318/v1/traces'\n"
+    )
+    WARN_NAMES = (
+        "OTEL_LOG_USER_PROMPTS",
+        "OTEL_LOG_TOOL_DETAILS",
+        "OTEL_LOG_TOOL_CONTENT",
+        "OTEL_LOG_ASSISTANT_RESPONSES",
+        "OTEL_LOG_RAW_API_BODIES",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+    )
+
+    def _run(self, endpoint, environ=None, prefix=(), guard=False):
+        from claude_code_plugin import cli
+
+        env = {} if environ is None else dict(environ)
+        argv = [*prefix, "env", "--endpoint", endpoint]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(cli.os, "environ", env):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                if guard:
+                    with mock.patch("builtins.open", side_effect=AssertionError("file open")), \
+                         mock.patch("socket.socket", side_effect=AssertionError("socket")), \
+                         mock.patch.object(cli.tempfile, "mkstemp", side_effect=AssertionError("file create")), \
+                         mock.patch.object(cli.os, "replace", side_effect=AssertionError("file replace")):
+                        code = cli.main(argv)
+                else:
+                    code = cli.main(argv)
+        return code, stdout.getvalue(), stderr.getvalue(), env
+
+    def test_success_prints_exact_traces_only_block_without_side_effects(self):
+        env = {"OTEL_LOG_USER_PROMPTS": "SYNTHETIC-WARN-101"}
+        before = dict(env)
+        code, stdout, stderr, after = self._run(
+            "http://127.0.0.1:4318/v1/traces", environ=env, guard=True
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, self.ASSIGNMENTS)
+        self.assertEqual(stderr, "warning: OTEL_LOG_USER_PROMPTS is set; review telemetry settings\n")
+        self.assertNotIn("SYNTHETIC-WARN-101", stdout + stderr)
+        self.assertEqual(after, before)
+
+    def test_each_sensitive_variable_warns_by_name_even_when_empty(self):
+        env = {name: ("SYNTHETIC-" + name if name != "OTEL_LOG_TOOL_CONTENT" else "")
+               for name in self.WARN_NAMES}
+        code, stdout, stderr, _after = self._run(
+            "http://127.0.0.1:4318/v1/traces", environ=env
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, self.ASSIGNMENTS)
+        self.assertEqual(stderr, "".join(
+            f"warning: {name} is set; review telemetry settings\n" for name in self.WARN_NAMES
+        ))
+        for value in env.values():
+            if value:
+                self.assertNotIn(value, stdout + stderr)
+
+    def test_ipv6_endpoint_is_reconstructed_with_brackets(self):
+        expected = self.ASSIGNMENTS.replace(
+            "http://127.0.0.1:4318/v1/traces", "http://[::1]:4318/v1/traces"
+        )
+        code, stdout, stderr, _env = self._run("http://[::1]:4318/v1/traces")
+        self.assertEqual((code, stdout, stderr), (0, expected, ""))
+
+    def test_invalid_endpoints_have_fixed_stderr_and_empty_stdout(self):
+        marker = "SYNTHETIC-ENDPOINT-503"
+        rejected = (
+            "https://127.0.0.1:4318/v1/traces",
+            "http://example.invalid:4318/v1/traces",
+            "http://127.0.0.1/v1/traces",
+            "http://127.0.0.1:0/v1/traces",
+            "http://127.0.0.1:65536/v1/traces",
+            "http://127.0.0.1:bad/v1/traces",
+            "http://127.0.0.1:4318/other",
+            "http://127.0.0.1:4318/v1/traces?",
+            "http://127.0.0.1:4318/v1/traces#",
+            "http://user@127.0.0.1:4318/v1/traces",
+            "http://127.0.0.1:4318:99/v1/traces",
+            "http://[::1:4318/v1/traces",
+            " http://127.0.0.1:4318/v1/traces",
+            "http://127.0.0.1:4318/v1/traces\t",
+            "http://127.0.0.1:4318/" + marker + "/v1/traces",
+            "http://127.0.0.1:4318/v1/\x00traces",
+        )
+        for endpoint in rejected:
+            with self.subTest(endpoint=repr(endpoint)):
+                code, stdout, stderr, _env = self._run(endpoint)
+                self.assertEqual(code, 2)
+                self.assertEqual(stdout, "")
+                self.assertEqual(stderr, "error: invalid env arguments\n")
+                self.assertNotIn(marker, stderr)
+
+    def test_env_usage_errors_do_not_reflect_supplied_values(self):
+        from claude_code_plugin import cli
+
+        marker = "SYNTHETIC-USAGE-607"
+        for argv in (
+            ["env", "--endpoint", "http://127.0.0.1:4318/v1/traces", "--bad", marker],
+            ["env", "--endpoint"],
+            ["env"],
+        ):
+            with self.subTest(argv=argv):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    code = cli.main(argv)
+                self.assertEqual(code, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "error: invalid env arguments\n")
+                self.assertNotIn(marker, stderr.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
