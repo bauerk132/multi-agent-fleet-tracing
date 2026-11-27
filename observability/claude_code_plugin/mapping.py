@@ -20,7 +20,9 @@ What S4 does:
   counted in duplicate_spans. A dropped span never claims its identity.
 - Projection (D1): each output span has only traceId, spanId, parentSpanId
   (omitted when None or ""), name, startTimeUnixNano and endTimeUnixNano
-  (each omitted when None or not an int), attributes and status. Nothing else is
+  (each omitted when None, not an int, or outside 0..MAX_TIME_NS; an int
+  outside that range is counted in out_of_range_timestamps, S11), attributes
+  and status. Nothing else is
   ever emitted: no resource, scope, events, kind or resource attributes.
 - Attributes (D8): agent.name ("claude-code") and observation.source
   ("otel-export") on every span, plus error.type when the status is an error.
@@ -176,6 +178,11 @@ KIND_BY_NAME = {
     "tool.exec": "tool",
 }
 
+# Largest start/end time kept (S11). 2**63 - 1_000_000 ns is about year 2262;
+# the 1 ms margin keeps the importer's float-to-microsecond round-trip inside
+# SQLite int64 (2**63 - 307 and above overflow there).
+MAX_TIME_NS = 2 ** 63 - 1_000_000
+
 COUNTER_KEYS = (
     "spans_in",
     "spans_out",
@@ -190,6 +197,7 @@ COUNTER_KEYS = (
     "folded_spans",
     "orphan_folds",
     "reparented_spans",
+    "out_of_range_timestamps",
 )
 
 # Rank of each outcome when a parent has several (S6): the highest wins.
@@ -445,11 +453,14 @@ def map_spans(records):
     adapter.flatten_lines, or any other value; anything that is not a dict is
     counted in invalid_ids and dropped). ``spans`` is a list of dicts with only
     the keys traceId, spanId, parentSpanId (omitted for a root), name,
-    startTimeUnixNano and endTimeUnixNano (each omitted when not an int),
-    attributes and status. ``counters`` is a dict with the int keys spans_in,
-    spans_out, unknown_span_types, invalid_ids, duplicate_spans, invalid_status,
-    events_dropped, stripped_attributes, unmapped_attributes, unsafe_values,
-    folded_spans, orphan_folds and reparented_spans, all always present.
+    startTimeUnixNano and endTimeUnixNano (each omitted when not an int in
+    0..MAX_TIME_NS, S11), attributes and status. ``counters`` is a dict with the
+    int keys spans_in, spans_out, unknown_span_types, invalid_ids,
+    duplicate_spans, invalid_status, events_dropped, stripped_attributes,
+    unmapped_attributes, unsafe_values, folded_spans, orphan_folds,
+    reparented_spans and out_of_range_timestamps, all always present. An int
+    time outside 0..MAX_TIME_NS is counted once per field in
+    out_of_range_timestamps; a missing or non-int time is not counted.
 
     Routing is by record["name"] only (see the module docstring). Status
     messages from the source are never read or copied. For each kept span, the
@@ -544,12 +555,14 @@ def map_spans(records):
         if isinstance(parent_id, str) and parent_id:
             out["parentSpanId"] = parent_id
         out["name"] = v1_name
-        start = record.get("startTimeUnixNano")
-        if _is_int(start):
-            out["startTimeUnixNano"] = start
-        end = record.get("endTimeUnixNano")
-        if _is_int(end):
-            out["endTimeUnixNano"] = end
+        for field in ("startTimeUnixNano", "endTimeUnixNano"):
+            value = record.get(field)
+            if not _is_int(value):
+                continue
+            if 0 <= value <= MAX_TIME_NS:
+                out[field] = value
+            else:
+                counters["out_of_range_timestamps"] += 1
         out["attributes"] = out_attributes
         out["status"] = status
         spans.append(out)

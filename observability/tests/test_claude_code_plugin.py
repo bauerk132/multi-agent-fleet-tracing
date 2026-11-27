@@ -1891,6 +1891,7 @@ class Step3MapSpansCoreTests(unittest.TestCase):
             "duplicate_spans": 0, "invalid_status": 0, "events_dropped": 0,
             "stripped_attributes": 0, "unmapped_attributes": 0, "unsafe_values": 0,
             "folded_spans": 0, "orphan_folds": 0, "reparented_spans": 0,
+            "out_of_range_timestamps": 0,
         })
 
     def test_every_output_span_and_the_whole_list_pass_bridge_validation(self):
@@ -2820,6 +2821,7 @@ S8_MERGED_KEYS = frozenset(S8_FLATTEN_KEYS | {
     "duplicate_spans", "invalid_status", "events_dropped",
     "stripped_attributes", "unmapped_attributes", "unsafe_values",
     "folded_spans", "orphan_folds", "reparented_spans",
+    "out_of_range_timestamps",
     "hook_spans", "content_attributes_seen",
 })
 
@@ -3056,6 +3058,115 @@ class Step3RoundTripTests(unittest.TestCase):
             spans, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
         ).encode("ascii")
         self.assertEqual(raw, expected)
+
+
+class Step3TimestampBoundTests(unittest.TestCase):
+    """M7-B step 3 S11: start/end times are kept only when an int in 0..MAX_TIME_NS."""
+
+    def _one(self, start=1000, end=2000, drop=()):
+        rec = _rec(span_id=_sid(1))
+        rec["startTimeUnixNano"] = start
+        rec["endTimeUnixNano"] = end
+        for key in drop:
+            del rec[key]
+        spans, counters = _map_spans([rec])
+        self.assertEqual(len(spans), 1)
+        return spans[0], counters
+
+    def test_max_time_ns_value(self):
+        from claude_code_plugin import mapping
+        self.assertEqual(mapping.MAX_TIME_NS, 2 ** 63 - 1_000_000)
+
+    def test_exact_max_is_kept_for_start_and_end(self):
+        from claude_code_plugin import mapping
+        m = mapping.MAX_TIME_NS
+        span, counters = self._one(start=m, end=m)
+        self.assertEqual(span["startTimeUnixNano"], m)
+        self.assertEqual(span["endTimeUnixNano"], m)
+        self.assertEqual(counters["out_of_range_timestamps"], 0)
+
+    def test_one_past_max_is_dropped_and_counted_per_field(self):
+        from claude_code_plugin import mapping
+        m = mapping.MAX_TIME_NS
+        span, counters = self._one(start=m + 1, end=2000)
+        self.assertNotIn("startTimeUnixNano", span)
+        self.assertEqual(span["endTimeUnixNano"], 2000)
+        self.assertEqual(counters["out_of_range_timestamps"], 1)
+
+        span, counters = self._one(start=1000, end=m + 1)
+        self.assertEqual(span["startTimeUnixNano"], 1000)
+        self.assertNotIn("endTimeUnixNano", span)
+        self.assertEqual(counters["out_of_range_timestamps"], 1)
+
+        span, counters = self._one(start=m + 1, end=m + 1)
+        self.assertNotIn("startTimeUnixNano", span)
+        self.assertNotIn("endTimeUnixNano", span)
+        self.assertEqual(counters["out_of_range_timestamps"], 2)
+
+    def test_zero_is_kept(self):
+        span, counters = self._one(start=0, end=0)
+        self.assertEqual(span["startTimeUnixNano"], 0)
+        self.assertEqual(span["endTimeUnixNano"], 0)
+        self.assertEqual(counters["out_of_range_timestamps"], 0)
+
+    def test_negative_and_huge_ints_are_dropped_and_counted(self):
+        span, counters = self._one(start=-1, end=10 ** 21)
+        self.assertNotIn("startTimeUnixNano", span)
+        self.assertNotIn("endTimeUnixNano", span)
+        self.assertEqual(counters["out_of_range_timestamps"], 2)
+
+    def test_bool_is_not_counted_and_not_emitted(self):
+        span, counters = self._one(start=True, end=False)
+        self.assertNotIn("startTimeUnixNano", span)
+        self.assertNotIn("endTimeUnixNano", span)
+        self.assertEqual(counters["out_of_range_timestamps"], 0)
+
+    def test_none_and_missing_are_not_counted(self):
+        span, counters = self._one(start=None, end=2000)
+        self.assertNotIn("startTimeUnixNano", span)
+        self.assertEqual(counters["out_of_range_timestamps"], 0)
+
+        span, counters = self._one(drop=("startTimeUnixNano", "endTimeUnixNano"))
+        self.assertNotIn("startTimeUnixNano", span)
+        self.assertNotIn("endTimeUnixNano", span)
+        self.assertEqual(counters["out_of_range_timestamps"], 0)
+
+    def test_counter_is_int_and_present_on_empty_input(self):
+        _spans, counters = _map_spans([])
+        self.assertIn("out_of_range_timestamps", counters)
+        self.assertIs(type(counters["out_of_range_timestamps"]), int)
+        self.assertEqual(counters["out_of_range_timestamps"], 0)
+
+    def _e2e(self, value):
+        from claude_code_plugin import mapping
+        from agentscope_importer import importer, ledger
+        span = _s8_span(
+            "claude_code.interaction", S8_ROOT,
+            attributes={"session.id": S8_SESSION, "interaction.sequence": 1},
+            status={"code": 1},
+        )
+        span["startTimeUnixNano"] = str(value)
+        span["endTimeUnixNano"] = str(value)
+        spans, counters = mapping.convert_lines([_s8_line([span])])
+        raw = mapping.serialize(spans)
+        bridge._parse_source_snapshot(raw, "claude-code")
+        importer.import_bytes(ledger.open_ledger(":memory:"), raw, "claude-code")
+        return spans, counters
+
+    def test_end_to_end_int64_max_is_dropped_and_imports(self):
+        spans, counters = self._e2e(2 ** 63 - 1)
+        self.assertEqual(len(spans), 1)
+        self.assertNotIn("startTimeUnixNano", spans[0])
+        self.assertNotIn("endTimeUnixNano", spans[0])
+        self.assertEqual(counters["out_of_range_timestamps"], 2)
+
+    def test_end_to_end_exact_max_is_kept_and_imports(self):
+        from claude_code_plugin import mapping
+        m = mapping.MAX_TIME_NS
+        spans, counters = self._e2e(m)
+        self.assertEqual(spans[0]["startTimeUnixNano"], m)
+        self.assertEqual(spans[0]["endTimeUnixNano"], m)
+        self.assertEqual(counters["out_of_range_timestamps"], 0)
 
 
 def _s9_cli():
