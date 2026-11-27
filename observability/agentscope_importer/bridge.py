@@ -62,6 +62,21 @@ ATTRIBUTE_ALLOWLIST = frozenset(SAFE_ATTRIBUTE_KEYS) | frozenset({
     "fleet.trace",
     "gen_ai.tool.call.id",
 })
+# What the claude_code_plugin adapter emits (claude_code_plugin/_vocab.py and
+# mapping.py), copied by value so the bridge does not import the plugin.
+# tests/test_agentscope_bridge_live.py pins these equal to the adapter's lists.
+LIVE_CLAUDE_CODE_SPAN_KEYS = frozenset({
+    "traceId", "spanId", "parentSpanId", "name",
+    "startTimeUnixNano", "endTimeUnixNano", "attributes", "status",
+})
+LIVE_CLAUDE_CODE_SPAN_NAMES = frozenset({"agent.run", "llm.call", "tool.exec", "hook.exec"})
+LIVE_CLAUDE_CODE_ATTRIBUTE_KEYS = frozenset({
+    "agent.name", "agent.role", "error.type", "fleet.span", "fleet.trace",
+    "gen_ai.request.model", "gen_ai.tool.call.id", "gen_ai.tool.name",
+    "gen_ai.usage.cache_creation.input_tokens", "gen_ai.usage.cache_read.input_tokens",
+    "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens",
+    "observation.completeness", "observation.source", "session.id", "turn.id",
+})
 TOP_LEVEL_KEYS = frozenset({"schema_version", "source", "run", "spans", "events"})
 RUN_KEYS = frozenset({"native_id", "status", "started_at", "ended_at", "metadata"})
 SPAN_KEYS = frozenset({
@@ -1847,7 +1862,10 @@ def _check_live_claude_code_spans(source_kind, parsed):
 
     Only the claude_code_plugin adapter's JSON array of flat spans is
     accepted. Every span must carry agent.name "claude-code" and
-    observation.source "otel-export". Attribute values are never echoed.
+    observation.source "otel-export". Every span must also use only the
+    fields, span names and attribute keys the adapter emits (the
+    LIVE_CLAUDE_CODE_* constants). Attribute values, keys and names are
+    never echoed in the refusal message.
     """
     if source_kind != "spans":
         raise BridgeError("live Claude Code input must be the adapter's JSON span array; run `python -m claude_code_plugin convert` first")
@@ -1859,6 +1877,24 @@ def _check_live_claude_code_spans(source_kind, parsed):
                 or attributes.get("agent.name") != "claude-code"
                 or attributes.get("observation.source") != "otel-export"):
             raise BridgeError("live Claude Code spans must carry agent.name claude-code and observation.source otel-export")
+        if set(span) - LIVE_CLAUDE_CODE_SPAN_KEYS:
+            raise BridgeError("live Claude Code span carries a field the adapter never emits")
+        if span.get("name") not in LIVE_CLAUDE_CODE_SPAN_NAMES:
+            raise BridgeError("live Claude Code span name is not one the adapter emits")
+        if set(attributes) - LIVE_CLAUDE_CODE_ATTRIBUTE_KEYS:
+            raise BridgeError("live Claude Code span carries an attribute the adapter never emits")
+
+
+def _carries_synthetic_marker(document):
+    """True if a canonical document carries a "synthetic" key in any attribute map.
+
+    Canonical documents keep attributes on each span and run metadata on the
+    run. Both are checked. Resource attributes never reach a canonical
+    document (live normalization keeps only service.name and service.version).
+    """
+    maps = [span.get("attributes") for span in document.get("spans", []) if isinstance(span, dict)]
+    maps.append(document.get("run", {}).get("metadata"))
+    return any(isinstance(entry, dict) and "synthetic" in entry for entry in maps)
 
 
 def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synthetic_only=False, live=False):
@@ -1881,7 +1917,10 @@ def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synth
     acknowledgment. Both acknowledgments must be exact booleans (True or
     False); anything else is refused before any import or delivery.
     Live delivery also refuses, before any import, a snapshot with a
-    duplicate span id or a parent cycle.
+    duplicate span id or a parent cycle. Live Claude Code delivery also
+    refuses any span field, span name or attribute key the adapter never
+    emits, and live delivery of either producer refuses any document
+    carrying a "synthetic" attribute.
     """
     if not isinstance(live, bool) or not isinstance(synthetic_only, bool):
         raise BridgeError("live and synthetic-only acknowledgments must be True or False")
@@ -1916,6 +1955,8 @@ def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synth
             for document in documents:
                 if document["run"]["metadata"]["producer"] != producer:
                     raise BridgeError("live delivery document producer must match the requested producer")
+                if _carries_synthetic_marker(document):
+                    raise BridgeError("live delivery refuses the synthetic marker; real observations never carry it")
     except BridgeError:
         raise
     except (ValueError, TypeError, OverflowError, UnicodeError, RecursionError):

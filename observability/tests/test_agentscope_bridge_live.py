@@ -20,6 +20,7 @@ from agentscope_importer import bridge, ledger  # noqa: E402
 from agentscope_importer.bridge import BridgeError, deliver_snapshot  # noqa: E402
 from agentscope_importer.mapper import canonical_bytes  # noqa: E402
 from claude_code_plugin import mapping as cc_mapping  # noqa: E402
+from claude_code_plugin import _vocab  # noqa: E402
 from tests.test_claude_code_plugin import _s8_lines  # noqa: E402
 from tests.test_agentscope_bridge import (  # noqa: E402
     BASE, CHILD, ROOT, TRACE_A, pinned_agentscope_projections, readback_for,
@@ -501,6 +502,170 @@ class LiveDroppedRunTests(unittest.TestCase):
         self.assertEqual(send.call_count, 1)
         self.assertEqual(result["mode"], "live")
         self.assertEqual(ledger.counts(self.conn)["imports"], 1)
+
+
+class LiveClaudeCodeShapeTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = ledger.open_ledger(":memory:")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def assert_refused(self, raw, producer="claude-code", message=None):
+        with patch.object(bridge, "_deliver_document") as send, \
+                patch.object(bridge, "import_bytes", wraps=bridge.import_bytes) as imported:
+            with self.assertRaises(BridgeError) as caught:
+                deliver_snapshot(
+                    self.conn, raw, producer, "http://127.0.0.1:8765",
+                    "fake-token", live=True,
+                )
+        send.assert_not_called()
+        imported.assert_not_called()
+        self.assertEqual(ledger.counts(self.conn)["imports"], 0)
+        if message is not None:
+            self.assertIn(message, str(caught.exception))
+        return str(caught.exception)
+
+    def test_extra_span_fields_refused(self):
+        extras = [
+            ("events", [{"name": "x", "attributes": {}}]),
+            ("resource", {}),
+            ("scope", {}),
+            ("kind", 1),
+        ]
+        for field, value in extras:
+            with self.subTest(field=field):
+                spans = claude_code_spans()
+                spans[1][field] = value
+                # events is refused earlier by the general validator (its own
+                # message), so only the refusal itself is asserted for it.
+                message = None if field == "events" else "field the adapter never emits"
+                self.assert_refused(cc_mapping.serialize(spans), message=message)
+
+    def test_span_names_outside_adapter_refused(self):
+        for name in ("state.write", "agent.handoff", "subagent.spawn", "approval.request"):
+            with self.subTest(name=name):
+                spans = claude_code_spans()
+                spans[1]["name"] = name
+                self.assert_refused(
+                    cc_mapping.serialize(spans),
+                    message="span name is not one the adapter emits",
+                )
+
+    def test_attributes_outside_adapter_refused(self):
+        for key, value in (
+            ("copilot.agent.type", "x"),
+            ("hermes.attempt", 1),
+            ("approval.kind", "x"),
+            ("synthetic", True),
+        ):
+            with self.subTest(key=key):
+                spans = claude_code_spans()
+                spans[1]["attributes"][key] = value
+                self.assert_refused(
+                    cc_mapping.serialize(spans),
+                    message="attribute the adapter never emits",
+                )
+
+    def test_refusal_does_not_echo_key_or_value(self):
+        spans = claude_code_spans()
+        spans[1]["attributes"]["copilot.agent.type"] = "CANARY-VAL-91c2"
+        message = self.assert_refused(
+            cc_mapping.serialize(spans),
+            message="attribute the adapter never emits",
+        )
+        self.assertNotIn("copilot.agent.type", message)
+        self.assertNotIn("CANARY-VAL-91c2", message)
+
+    def test_live_copilot_synthetic_span_attribute_refused(self):
+        spans = copilot_spans()
+        spans[1]["attributes"]["synthetic"] = "true"
+        self.assert_refused(
+            json.dumps(spans, sort_keys=True).encode(),
+            producer="copilot", message="synthetic marker",
+        )
+
+    def test_live_copilot_synthetic_span_attribute_refused_in_otlp(self):
+        spans = copilot_spans()
+        spans[1]["attributes"]["synthetic"] = "true"
+        self.assert_refused(
+            json.dumps(copilot_otlp(spans)).encode(),
+            producer="copilot", message="synthetic marker",
+        )
+
+    def test_live_copilot_synthetic_false_refused(self):
+        spans = copilot_spans()
+        spans[1]["attributes"]["synthetic"] = "false"
+        self.assert_refused(
+            json.dumps(spans, sort_keys=True).encode(),
+            producer="copilot", message="synthetic marker",
+        )
+
+    def test_live_copilot_synthetic_resource_attribute_not_carried(self):
+        # Live OTLP normalization keeps only service.name and service.version
+        # on the resource, so a resource-level synthetic marker never reaches
+        # a canonical document and the delivery is not refused for it.
+        payload = copilot_otlp(copilot_spans())
+        payload["resourceSpans"][0]["resource"]["attributes"] = [
+            {"key": "synthetic", "value": {"stringValue": "true"}},
+        ]
+        raw = json.dumps(payload).encode()
+        _kind, _parsed, documents, _norm = bridge._parse_source_snapshot(
+            raw, "copilot", live=True
+        )
+        for document in documents:
+            self.assertNotIn("synthetic", json.dumps(document, sort_keys=True))
+        with patch.object(bridge, "_deliver_document", return_value=CC_RESULT) as send:
+            deliver_snapshot(
+                self.conn, raw, "copilot", "http://127.0.0.1:8765",
+                "fake-token", live=True,
+            )
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(ledger.counts(self.conn)["imports"], 1)
+
+    def test_synthetic_only_delivery_still_accepts_synthetic_marker(self):
+        spans = copilot_spans()
+        for span, name in zip(spans, ("agent.run", "llm.call", "tool.exec")):
+            span["name"] = name
+        spans[0]["attributes"].pop("gen_ai.system")
+        spans[1]["attributes"]["synthetic"] = "true"
+        raw = json.dumps(spans, sort_keys=True).encode()
+        with patch.object(bridge, "_deliver_document", return_value=CC_RESULT) as send:
+            result = deliver_snapshot(
+                self.conn, raw, "copilot", "http://127.0.0.1:8765",
+                "fake-token", synthetic_only=True,
+            )
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(result["mode"], "synthetic")
+        self.assertEqual(ledger.counts(self.conn)["imports"], 1)
+
+    def test_live_claude_code_clean_snapshot_delivered_once(self):
+        with patch.object(bridge, "_deliver_document", return_value=CC_RESULT) as send:
+            result = deliver_snapshot(
+                self.conn, claude_code_raw(), "claude-code",
+                "http://127.0.0.1:8765", "fake-token", live=True,
+            )
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(result["mode"], "live")
+        self.assertEqual(ledger.counts(self.conn)["imports"], 1)
+
+    def test_live_constants_pinned_to_adapter(self):
+        self.assertEqual(
+            bridge.LIVE_CLAUDE_CODE_SPAN_NAMES,
+            frozenset(_vocab.SPAN_TYPE_TO_V1.values()),
+        )
+        self.assertEqual(
+            bridge.LIVE_CLAUDE_CODE_ATTRIBUTE_KEYS,
+            frozenset(_vocab.OUTPUT_ATTRIBUTE_KEYS),
+        )
+
+    def test_adapter_output_within_live_constants(self):
+        for span in claude_code_spans():
+            with self.subTest(name=span.get("name")):
+                self.assertLessEqual(set(span), bridge.LIVE_CLAUDE_CODE_SPAN_KEYS)
+                self.assertLessEqual(
+                    set(span["attributes"]), bridge.LIVE_CLAUDE_CODE_ATTRIBUTE_KEYS
+                )
 
 
 if __name__ == "__main__":
