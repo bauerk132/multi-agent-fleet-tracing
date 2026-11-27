@@ -438,5 +438,56 @@ class ReceiverPrivacyTests(unittest.TestCase):
         self.assertNotIn(marker, json.dumps(health))
 
 
+class ReceiverCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sink = Path(self.tmp.name) / "received.jsonl"
+        self.receiver = LocalReceiver(out_path=self.sink).start()
+
+    def tearDown(self):
+        self.receiver.stop()
+        self.tmp.cleanup()
+
+    def test_project_exporter_upload_keeps_payload_span_sink_and_health_contract(self):
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExportResult
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        from opentelemetry.trace import format_span_id, format_trace_id
+
+        from otlp_json import OTLPJSONExporter
+
+        provider = TracerProvider(resource=Resource({"service.name": "receiver-compat-test"}))
+        memory = InMemorySpanExporter()
+        provider.add_span_processor(SimpleSpanProcessor(memory))
+        tracer = provider.get_tracer("receiver-compat-test", "1.0")
+        with tracer.start_as_current_span(
+            "synthetic receiver compatibility",
+            attributes={"fixture.marker": "SYNTHETIC-RECEIVER-601"},
+        ) as span:
+            expected_trace_id = format_trace_id(span.get_span_context().trace_id)
+            expected_span_id = format_span_id(span.get_span_context().span_id)
+        provider.shutdown()
+
+        result = OTLPJSONExporter(self.receiver.endpoint).export(memory.get_finished_spans())
+        self.assertEqual(result, SpanExportResult.SUCCESS)
+        self.assertEqual(len(self.receiver.payloads), 1)
+        self.assertEqual(len(self.receiver.spans), 1)
+        flattened = self.receiver.spans[0]
+        self.assertEqual(flattened["name"], "synthetic receiver compatibility")
+        self.assertEqual(flattened["traceId"], expected_trace_id)
+        self.assertEqual(flattened["spanId"], expected_span_id)
+        self.assertEqual(flattened["attributes"]["fixture.marker"], "SYNTHETIC-RECEIVER-601")
+
+        lines = self.sink.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        written = json.loads(lines[0])
+        self.assertEqual(written["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
+                         "synthetic receiver compatibility")
+        with urllib.request.urlopen(self.receiver.endpoint.replace("/v1/traces", "/health"), timeout=2) as response:
+            health = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(health, {"status": "ok", "spans_received": 1, "payloads_received": 1})
+
+
 if __name__ == "__main__":
     unittest.main()
