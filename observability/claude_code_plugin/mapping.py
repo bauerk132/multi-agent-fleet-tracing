@@ -135,11 +135,11 @@ to the nearest kept ancestor, so the output tree stays connected.
 What S8 adds: convert_lines(lines) runs adapter.flatten_lines and then map_spans,
 and returns one merged counters dict (the flatten counters, the mapping counters
 and two tripwires, see below). serialize(spans) gives the canonical bytes of the
-output (D1). The tripwires (D10) are computed over every flatten record, kept or
-not, and are numbers only: hook_spans counts claude_code.hook records, and
-content_attributes_seen counts the span and resource attribute keys that are
-content keys or end with a strip suffix, plus one for each user_prompt whose
-value is not exactly "<REDACTED>".
+output (D1). The tripwires (D10) are numbers only. content_attributes_seen is
+counted by adapter.flatten_lines on the raw input, before any decoding, cap or
+duplicate handling, through _content_probe: in span, resource, scope and event
+attributes, plus tool.output span events (S14). A resource key counts once per
+resource entry. hook_spans counts claude_code.hook records, kept or not.
 
 Counters: spans_in (every record), spans_out, unknown_span_types, invalid_ids,
 duplicate_spans, invalid_status, events_dropped, stripped_attributes,
@@ -662,34 +662,40 @@ def map_spans(records):
     return spans, counters
 
 
-def _tripwires(records):
-    """Return (hook_spans, content_attributes_seen) over every flatten record (D10).
+def _content_probe(where, key, raw_value):
+    """Return True when one raw KeyValue item carries content (D10, S14).
 
-    hook_spans counts the records named claude_code.hook, whatever their ids or
-    kept state. content_attributes_seen counts, per record, each span attribute
-    key and each resource attribute key that is in _vocab.CONTENT_KEYS or ends
-    with one of _vocab.STRIP_SUFFIXES, plus one for each user_prompt key (span
-    or resource) whose value is not exactly _vocab.REDACTED_PROMPT. Absent
-    user_prompt counts nothing. Only numbers are returned.
+    Called by adapter.flatten_lines on every raw item, before decoding, so it
+    sees dropped, duplicate and over-cap items too. ``where`` is "resource",
+    "scope", "span", "event" or "event_name" (an event name, with raw_value
+    None). An event name is True only when it is in CONTENT_EVENT_NAMES. For any
+    other place: True for a content key or a strip suffix, for a user_prompt
+    whose raw value is not exactly {"stringValue": REDACTED_PROMPT} (a missing
+    value counts), and, in event attributes, for a key in EVENT_CONTENT_KEYS.
+    False otherwise.
     """
-    hook_spans = 0
-    content_seen = 0
+    if where == "event_name":
+        # An event name is not an attribute key: only the event-name list applies.
+        return key in _vocab.CONTENT_EVENT_NAMES
+    if key in _vocab.CONTENT_KEYS or key.endswith(_vocab.STRIP_SUFFIXES):
+        return True
+    if key == "user_prompt":
+        return raw_value != {"stringValue": _vocab.REDACTED_PROMPT}
+    if where == "event":
+        return key in _vocab.EVENT_CONTENT_KEYS
+    return False
+
+
+def _hook_spans(records):
+    """Return the number of flatten records named claude_code.hook (D10).
+
+    Counts whatever their ids or kept state. Returns an int only.
+    """
+    count = 0
     for record in records:
-        if not isinstance(record, dict):
-            continue
-        if record.get("name") == "claude_code.hook":
-            hook_spans += 1
-        for source in (record.get("attributes"), record.get("resource_attributes")):
-            if not isinstance(source, dict):
-                continue
-            for key, value in source.items():
-                if not isinstance(key, str):
-                    continue
-                if key in _vocab.CONTENT_KEYS or key.endswith(_vocab.STRIP_SUFFIXES):
-                    content_seen += 1
-                elif key == "user_prompt" and value != _vocab.REDACTED_PROMPT:
-                    content_seen += 1
-    return hook_spans, content_seen
+        if isinstance(record, dict) and record.get("name") == "claude_code.hook":
+            count += 1
+    return count
 
 
 def convert_lines(lines):
@@ -697,19 +703,17 @@ def convert_lines(lines):
 
     ``lines`` is passed to adapter.flatten_lines unchanged (a bare str or bytes
     raises TypeError there). The flatten records then go through map_spans. The
-    returned counters dict is the merge of the flatten counters and the mapping
-    counters, plus the two D10 tripwires hook_spans and content_attributes_seen.
-    The flatten and mapping counter names are disjoint (a test checks this), so
-    nothing is overwritten. Every value is an int. Output spans are the same
-    flat v1 spans as map_spans returns.
+    returned counters dict is the merge of the flatten counters (which include
+    content_attributes_seen, counted through _content_probe) and the mapping
+    counters, plus the D10 tripwire hook_spans. The flatten and mapping counter
+    names are disjoint (a test checks this), so nothing is overwritten. Every
+    value is an int. Output spans are the same flat v1 spans as map_spans returns.
     """
-    records, flatten_counters = flatten_lines(lines)
+    records, flatten_counters = flatten_lines(lines, content_probe=_content_probe)
     spans, mapping_counters = map_spans(records)
-    hook_spans, content_seen = _tripwires(records)
     counters = dict(flatten_counters)
     counters.update(mapping_counters)
-    counters["hook_spans"] = hook_spans
-    counters["content_attributes_seen"] = content_seen
+    counters["hook_spans"] = _hook_spans(records)
     return spans, counters
 
 

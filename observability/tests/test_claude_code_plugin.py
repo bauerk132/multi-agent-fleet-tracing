@@ -3367,6 +3367,246 @@ def mapping_serialize_text(spans):
     return mapping.serialize(spans).decode("ascii")
 
 
+def _s14_line(spans, resource_attrs=None, scope_attrs=None):
+    # One receiver JSONL line with hand-built raw KeyValue lists.
+    scope_span = {"spans": spans}
+    if scope_attrs is not None:
+        scope_span["scope"] = {"attributes": scope_attrs}
+    return json.dumps({"resourceSpans": [{
+        "resource": {"attributes": list(resource_attrs or [])},
+        "scopeSpans": [scope_span],
+    }]})
+
+
+def _s14_span(span_id, attributes, events=None):
+    # A span from _s8_span with a raw attribute list and event list.
+    span = _s8_span("claude_code.tool", span_id)
+    span["attributes"] = list(attributes)
+    if events is not None:
+        span["events"] = list(events)
+    return span
+
+
+def _s14_event(name, attributes):
+    return {"name": name, "timeUnixNano": "1767225600123456789", "attributes": list(attributes)}
+
+
+S14_CANARY_KV = [
+    {"key": "content", "value": {"stringValue": "CANARY_CONTENT_1"}},
+    {"key": "output", "value": {"stringValue": "CANARY_CONTENT_2"}},
+    {"key": "diff", "value": {"stringValue": "CANARY_CONTENT_3"}},
+    {"key": "file_path", "value": {"stringValue": "CANARY_CONTENT_4"}},
+    {"key": "bash_command", "value": {"stringValue": "CANARY_CONTENT_5"}},
+]
+
+
+class Step3RawContentTripwireTests(unittest.TestCase):
+    """M7-B step 3 S14: the D10 content tripwire counts the raw input, numbers only."""
+
+    def _counters(self, lines):
+        from claude_code_plugin import mapping
+        return mapping.convert_lines(lines)[1]
+
+    def _baseline_stripped(self):
+        from claude_code_plugin import mapping
+        line = _s14_line([_s14_span(S8_TOOL, [])])
+        return mapping.convert_lines([line])[1]["stripped_attributes"]
+
+    def test_each_new_span_key_counts_once_and_is_stripped(self):
+        from claude_code_plugin import mapping
+        base = self._baseline_stripped()
+        for key in ("system_reminders", "system_prompt_preview",
+                    "user_system_prompt", "response.model_output"):
+            with self.subTest(key=key):
+                line = _s14_line([_s14_span(S8_TOOL, [_s8_kv(key, "CANARY_CONTENT_1")])])
+                spans, counters = mapping.convert_lines([line])
+                self.assertEqual(counters["content_attributes_seen"], 1)
+                self.assertEqual(counters["stripped_attributes"], base + 1)
+                for span in spans:
+                    self.assertNotIn(key, span["attributes"])
+                self.assertNotIn(b"CANARY_CONTENT_1", mapping.serialize(spans))
+
+    def test_non_scalar_content_value_counts(self):
+        values = (
+            {"kvlistValue": {"values": []}},
+            {"arrayValue": {"values": []}},
+            {"bytesValue": "AAA="},
+        )
+        for value in values:
+            with self.subTest(value=value):
+                attrs = [{"key": "tool_input", "value": value}]
+                counters = self._counters([_s14_line([_s14_span(S8_TOOL, attrs)])])
+                self.assertEqual(counters["content_attributes_seen"], 1)
+
+    def test_content_key_after_attribute_cap_counts_once(self):
+        attrs = [_s8_kv("synth.attr.%d" % i, i) for i in range(128)]
+        attrs.append(_s8_kv("tool_input", "CANARY_CONTENT_1"))
+        counters = self._counters([_s14_line([_s14_span(S8_TOOL, attrs)])])
+        self.assertEqual(counters["content_attributes_seen"], 1)
+        self.assertEqual(counters["dropped_attributes"], 1)
+
+    def test_duplicate_user_prompt_second_value_counts(self):
+        attrs = [
+            {"key": "user_prompt", "value": {"stringValue": "<REDACTED>"}},
+            {"key": "user_prompt", "value": {"stringValue": "CANARY_CONTENT_1"}},
+        ]
+        counters = self._counters([_s14_line([_s14_span(S8_ROOT, attrs)])])
+        self.assertEqual(counters["content_attributes_seen"], 1)
+
+    def test_single_redacted_user_prompt_counts_nothing(self):
+        attrs = [{"key": "user_prompt", "value": {"stringValue": "<REDACTED>"}}]
+        counters = self._counters([_s14_line([_s14_span(S8_ROOT, attrs)])])
+        self.assertEqual(counters["content_attributes_seen"], 0)
+
+    def test_user_prompt_int_or_missing_value_counts(self):
+        for attr in ({"key": "user_prompt", "value": {"intValue": 1}},
+                     {"key": "user_prompt"}):
+            with self.subTest(attr=attr):
+                counters = self._counters([_s14_line([_s14_span(S8_ROOT, [attr])])])
+                self.assertEqual(counters["content_attributes_seen"], 1)
+
+    def test_scope_attribute_content_key_counts(self):
+        line = _s14_line(
+            [_s14_span(S8_TOOL, [])],
+            scope_attrs=[{"key": "tool_input", "value": {"stringValue": "CANARY_CONTENT_1"}}],
+        )
+        self.assertEqual(self._counters([line])["content_attributes_seen"], 1)
+
+    def test_tool_output_event_counts_name_and_five_keys(self):
+        from claude_code_plugin import mapping
+        event = _s14_event("tool.output", S14_CANARY_KV)
+        line = _s14_line([_s14_span(S8_TOOL, [], events=[event])])
+        spans, counters = mapping.convert_lines([line])
+        self.assertEqual(counters["content_attributes_seen"], 6)
+        self.assertNotIn(b"CANARY_CONTENT", mapping.serialize(spans))
+
+    def test_other_event_name_counts_only_content_key(self):
+        event = _s14_event("other", [{"key": "content", "value": {"stringValue": "x"}}])
+        line = _s14_line([_s14_span(S8_TOOL, [], events=[event])])
+        self.assertEqual(self._counters([line])["content_attributes_seen"], 1)
+
+    def test_strip_suffix_keys_count_in_every_place(self):
+        # Neither key is a content key; only the suffix rule makes them count.
+        span = _s14_span(S8_TOOL, [_s8_kv("custom_truncated", True)],
+                         events=[_s14_event("other", [_s8_kv("custom_original_length", 9)])])
+        line = _s14_line([span], resource_attrs=[_s8_kv("other_original_length", 9)],
+                         scope_attrs=[_s8_kv("other_truncated", True)])
+        self.assertEqual(self._counters([line])["content_attributes_seen"], 4)
+
+    def test_non_str_keys_and_non_dict_items_are_skipped_by_the_scan(self):
+        attrs = [{"key": 5, "value": {"stringValue": "x"}}, {"key": None}, "tool_input",
+                 7, {"value": {"stringValue": "x"}},
+                 {"key": "tool_input", "value": {"stringValue": "CANARY_CONTENT_1"}}]
+        counters = self._counters([_s14_line([_s14_span(S8_TOOL, attrs)])])
+        self.assertEqual(counters["content_attributes_seen"], 1)
+
+    def test_event_name_uses_only_the_event_name_list(self):
+        # Event names that look like attribute keys are not content names.
+        from claude_code_plugin import mapping
+        for name in ("file_path", "user_prompt", "tool_input", "x_truncated", "content"):
+            self.assertFalse(mapping._content_probe("event_name", name, None), name)
+        self.assertTrue(mapping._content_probe("event_name", "tool.output", None))
+        events = [_s14_event(name, []) for name in ("file_path", "user_prompt", "tool_input")]
+        line = _s14_line([_s14_span(S8_TOOL, [], events=events)])
+        self.assertEqual(self._counters([line])["content_attributes_seen"], 0)
+
+    def test_content_key_on_span_attribute_alone_counts_nothing(self):
+        attrs = [{"key": "content", "value": {"stringValue": "x"}}]
+        counters = self._counters([_s14_line([_s14_span(S8_TOOL, attrs)])])
+        self.assertEqual(counters["content_attributes_seen"], 0)
+
+    def test_resource_key_counts_once_per_resource_entry(self):
+        spans = [_s14_span(S8_TOOL, []), _s14_span(S8_ROOT, []), _s14_span(S8_LLM, [])]
+        line = _s14_line(spans, resource_attrs=[
+            {"key": "tool_input", "value": {"stringValue": "CANARY_CONTENT_1"}},
+        ])
+        self.assertEqual(self._counters([line])["content_attributes_seen"], 1)
+
+    def test_span_past_max_spans_still_counted(self):
+        first = _s8_span("claude_code.interaction", S8_ROOT)
+        second = _s14_span(S8_TOOL, [_s8_kv("tool_input", "CANARY_CONTENT_1")])
+        line = _s14_line([first, second])
+        with mock.patch.object(adapter_module, "MAX_SPANS", 1):
+            counters = self._counters([line])
+        self.assertEqual(counters["content_attributes_seen"], 1)
+        self.assertEqual(counters["spans_over_limit"], 1)
+
+    def test_resource_after_max_spans_still_counted(self):
+        first = _s14_line([_s8_span("claude_code.interaction", S8_ROOT)])
+        second = _s14_line(
+            [_s14_span(S8_TOOL, [])],
+            resource_attrs=[{"key": "tool_input", "value": {"stringValue": "CANARY_CONTENT_1"}}],
+        )
+        with mock.patch.object(adapter_module, "MAX_SPANS", 1):
+            counters = self._counters([first, second])
+        self.assertEqual(counters["content_attributes_seen"], 1)
+        self.assertEqual(counters["spans_over_limit"], 1)
+
+    def test_span_with_bad_identity_type_still_counted(self):
+        span = _s14_span(S8_TOOL, [_s8_kv("tool_input", "CANARY_CONTENT_1")])
+        span["spanId"] = 7
+        counters = self._counters([_s14_line([span])])
+        self.assertEqual(counters["content_attributes_seen"], 1)
+        self.assertEqual(counters["skipped_items"], 1)
+
+    def test_new_places_leak_nothing_to_output(self):
+        from claude_code_plugin import mapping
+        kvlist = {"kvlistValue": {"values": [
+            {"key": "x", "value": {"stringValue": "CANARY_CONTENT_9"}},
+        ]}}
+        span_attrs = [
+            {"key": "tool_input", "value": kvlist},
+            _s8_kv("system_reminders", "CANARY_CONTENT_6"),
+            _s8_kv("response.model_output", "CANARY_CONTENT_7"),
+        ]
+        event = _s14_event("tool.output", S14_CANARY_KV)
+        line = _s14_line(
+            [_s14_span(S8_TOOL, span_attrs, events=[event])],
+            resource_attrs=[_s8_kv("user_system_prompt", "CANARY_CONTENT_8")],
+            scope_attrs=[_s8_kv("system_prompt_preview", "CANARY_CONTENT_10")],
+        )
+        spans, counters = mapping.convert_lines([line])
+        raw = mapping.serialize(spans).decode("ascii")
+        for n in range(1, 11):
+            self.assertNotIn("CANARY_CONTENT_%d" % n, raw)
+            self.assertNotIn("CANARY_CONTENT_%d" % n, repr(counters))
+        self.assertGreater(counters["content_attributes_seen"], 0)
+
+    def test_flatten_without_probe_has_no_content_key(self):
+        line = _s14_line([_s14_span(S8_TOOL, [_s8_kv("tool_input", "CANARY_CONTENT_1")])])
+        _spans, counters = flatten_lines([line])
+        self.assertEqual(set(counters), set(S8_FLATTEN_KEYS))
+        self.assertNotIn("content_attributes_seen", counters)
+
+    def test_flatten_with_false_probe_matches_no_probe_counters(self):
+        event = _s14_event("tool.output", S14_CANARY_KV)
+        line = _s14_line([_s14_span(S8_TOOL, [], events=[event])])
+        _a, plain = flatten_lines([line])
+        _b, probed = flatten_lines([line], content_probe=lambda where, key, value: False)
+        self.assertEqual(probed.pop("content_attributes_seen"), 0)
+        self.assertEqual(probed, plain)
+
+    def test_probe_receives_each_raw_place(self):
+        calls = []
+
+        def probe(where, key, value):
+            calls.append((where, key))
+            return False
+
+        event = _s14_event("tool.output", [_s8_kv("content", "x")])
+        line = _s14_line(
+            [_s14_span(S8_TOOL, [_s8_kv("a.span", 1)], events=[event])],
+            resource_attrs=[_s8_kv("a.resource", 1)],
+            scope_attrs=[_s8_kv("a.scope", 1)],
+        )
+        flatten_lines([line], content_probe=probe)
+        self.assertIn(("resource", "a.resource"), calls)
+        self.assertIn(("scope", "a.scope"), calls)
+        self.assertIn(("span", "a.span"), calls)
+        self.assertIn(("event_name", "tool.output"), calls)
+        self.assertIn(("event", "content"), calls)
+
+
 class Step3TimestampBoundTests(unittest.TestCase):
     """M7-B step 3 S11: start/end times are kept only when an int in 0..MAX_TIME_NS."""
 

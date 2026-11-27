@@ -122,6 +122,10 @@ STRIP_KEYS = frozenset({
     "hook_definitions",
     "error",
     "error_class",
+    "system_reminders",
+    "system_prompt_preview",
+    "user_system_prompt",
+    "response.model_output",
 })
 
 # Key prefixes never emitted. DOC-BETA, unconfirmed until live run.
@@ -140,7 +144,16 @@ CONTENT_KEYS = frozenset({
     "new_context",
     "bash_command",
     "hook_definitions",
+    "system_reminders",
+    "system_prompt_preview",
+    "user_system_prompt",
+    "response.model_output",
 })
+
+# Event attribute keys that carry content (source: Claude Code monitoring docs, tool.output span event under detailed beta tracing).
+EVENT_CONTENT_KEYS = frozenset({"content", "output", "diff", "file_path", "bash_command"})
+# Event names that carry content (source: Claude Code monitoring docs, tool.output span event under detailed beta tracing).
+CONTENT_EVENT_NAMES = frozenset({"tool.output"})
 
 
 def is_stripped(key):

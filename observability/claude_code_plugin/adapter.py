@@ -209,7 +209,24 @@ def _utf8_size(text):
         return len(text.encode("utf-8", "surrogatepass")), False
 
 
-def flatten_lines(lines):
+def _scan(items, where, probe):
+    """Return how many raw KeyValue items in ``items`` the probe flags.
+
+    ``items`` is a raw attributes list. A non-list value gives 0. A non-dict
+    item or a non-str key is skipped without a call. Each other item is passed
+    once to ``probe(where, key, raw_value)``, before any decoding.
+    """
+    if not isinstance(items, list):
+        return 0
+    found = 0
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("key"), str):
+            if probe(where, item["key"], item.get("value")):
+                found += 1
+    return found
+
+
+def flatten_lines(lines, *, content_probe=None):
     """Return ``(spans, counters)`` for the given receiver JSONL lines.
 
     ``lines`` must be an iterable of lines. A bare ``str``, ``bytes``,
@@ -308,6 +325,19 @@ def flatten_lines(lines):
     escapes) are accepted. The check runs only on lines that contain a surrogate
     escape, and it walks the decoded keys and strings without re-serializing or
     encoding the payload.
+
+    Content probe: ``content_probe`` is None by default, and then nothing changes
+    and no extra counter is added. When it is a callable, the counters also carry
+    ``content_attributes_seen``. The probe is called as
+    ``content_probe(where, key, raw_value)`` on every raw KeyValue item that is a
+    dict with a str key, before any decoding, cap or duplicate handling. ``where``
+    is ``"resource"``, ``"scope"``, ``"span"`` or ``"event"``, and ``raw_value`` is
+    the item's ``value`` as received (or None). Each True result adds one. For each
+    event with a str name the probe is also called once with ``"event_name"``.
+    Resource entries are scanned once each, even past the span cap. Span, scope and
+    event attributes are scanned for every dict span or scope, including skipped
+    ones. Malformed lines are not scanned. The adapter knows no vocabulary: the
+    probe decides what counts.
     """
     if isinstance(lines, (str, bytes, bytearray, memoryview)):
         raise TypeError(
@@ -320,6 +350,24 @@ def flatten_lines(lines):
         "skipped_items": 0, "dropped_attributes": 0, "invalid_timestamps": 0,
         "spans_over_limit": 0, "stream_truncated": 0,
     }
+    if content_probe is not None:
+        counters["content_attributes_seen"] = 0
+
+    def count_content(items, where):
+        if content_probe is not None:
+            counters["content_attributes_seen"] += _scan(items, where, content_probe)
+
+    def count_events(events):
+        if content_probe is None or not isinstance(events, list):
+            return
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            name = event.get("name")
+            if isinstance(name, str) and content_probe("event_name", name, None):
+                counters["content_attributes_seen"] += 1
+            count_content(event.get("attributes"), "event")
+
     total_limit = MAX_TOTAL_BYTES
     used = 0
 
@@ -395,6 +443,7 @@ def flatten_lines(lines):
             if resource is None:
                 resource_attrs = {}
             elif isinstance(resource, dict):
+                count_content(resource.get("attributes"), "resource")
                 if counters["spans"] >= MAX_SPANS:
                     # Cap already reached: no span under this resource can be kept,
                     # so its attributes are neither decoded nor counted.
@@ -414,6 +463,9 @@ def flatten_lines(lines):
                 if not isinstance(scope_span, dict):
                     counters["skipped_items"] += 1
                     continue
+                scope = scope_span.get("scope")
+                if isinstance(scope, dict):
+                    count_content(scope.get("attributes"), "scope")
                 span_list = scope_span.get("spans")
                 if span_list is None:
                     continue
@@ -424,6 +476,8 @@ def flatten_lines(lines):
                     if not isinstance(span, dict):
                         counters["skipped_items"] += 1
                         continue
+                    count_content(span.get("attributes"), "span")
+                    count_events(span.get("events"))
                     if counters["spans"] >= MAX_SPANS:
                         counters["spans_over_limit"] += 1
                         continue
