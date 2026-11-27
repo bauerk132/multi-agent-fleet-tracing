@@ -337,5 +337,65 @@ class LiveClaudeCodeBridgeTests(unittest.TestCase):
         self.assertIn(report["quality"], ("partial", "complete"))
 
 
+class LiveAcknowledgmentTypeTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = ledger.open_ledger(":memory:")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def assert_ack_type_refused(self, raw, producer, **flags):
+        with patch.object(bridge, "_deliver_document") as send, \
+                patch.object(bridge, "import_bytes", wraps=bridge.import_bytes) as imported:
+            with self.assertRaises(BridgeError) as caught:
+                deliver_snapshot(
+                    self.conn, raw, producer, "http://127.0.0.1:8765",
+                    "fake-token", **flags,
+                )
+        self.assertIn("must be True or False", str(caught.exception))
+        imported.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(ledger.counts(self.conn)["imports"], 0)
+
+    def test_non_boolean_acknowledgments_refused_before_import(self):
+        copilot_raw = json.dumps(copilot_spans(), sort_keys=True).encode()
+        cases = [
+            ("claude-code live=1", claude_code_raw(), "claude-code", {"live": 1}),
+            ("claude-code live=yes", claude_code_raw(), "claude-code", {"live": "yes"}),
+            ("claude-code live=1.0", claude_code_raw(), "claude-code", {"live": 1.0}),
+            ("copilot live=1", copilot_raw, "copilot", {"live": 1}),
+            ("claude-code synthetic_only=1", claude_code_raw(), "claude-code",
+             {"synthetic_only": 1}),
+            ("copilot synthetic_only=true", copilot_raw, "copilot",
+             {"synthetic_only": "true"}),
+            ("claude-code live=None", claude_code_raw(), "claude-code", {"live": None}),
+        ]
+        for label, raw, producer, flags in cases:
+            with self.subTest(case=label):
+                self.assert_ack_type_refused(raw, producer, **flags)
+
+    def test_refusal_does_not_echo_acknowledgment_value(self):
+        with patch.object(bridge, "_deliver_document") as send:
+            with self.assertRaises(BridgeError) as caught:
+                deliver_snapshot(
+                    self.conn, claude_code_raw(), "claude-code",
+                    "http://127.0.0.1:8765", "fake-token",
+                    live="CANARY-ACK-7f3a",
+                )
+        self.assertNotIn("CANARY-ACK-7f3a", str(caught.exception))
+        send.assert_not_called()
+        self.assertEqual(ledger.counts(self.conn)["imports"], 0)
+
+    def test_live_true_still_accepted_for_claude_code(self):
+        with patch.object(bridge, "_deliver_document", return_value=CC_RESULT) as send:
+            result = deliver_snapshot(
+                self.conn, claude_code_raw(), "claude-code",
+                "http://127.0.0.1:8765", "fake-token", live=True,
+            )
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(result["mode"], "live")
+        self.assertEqual(ledger.counts(self.conn)["imports"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

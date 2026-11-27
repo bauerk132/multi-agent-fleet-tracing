@@ -1859,8 +1859,11 @@ def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synth
     "claude-code" and observation.source "otel-export"; any other shape is
     refused before import or delivery. Every document's producer must equal
     the requested producer. Live delivery never accepts a synthetic-only
-    acknowledgment.
+    acknowledgment. Both acknowledgments must be exact booleans (True or
+    False); anything else is refused before any import or delivery.
     """
+    if not isinstance(live, bool) or not isinstance(synthetic_only, bool):
+        raise BridgeError("live and synthetic-only acknowledgments must be True or False")
     if live and synthetic_only:
         raise BridgeError("live and synthetic-only acknowledgments conflict; pass exactly one")
     if live:
