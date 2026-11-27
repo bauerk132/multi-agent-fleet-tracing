@@ -2723,5 +2723,274 @@ class Step3ReparentTests(unittest.TestCase):
         self.assertEqual(by_native[_sid(4)]["parent_native_id"], _sid(1))
 
 
+# M7-B step 3 S8: convert_lines (flatten + map) and serialize, end to end.
+S8_TRACE = "ab" * 16
+S8_ROOT = "a1b2c3d4e5f60001"
+S8_LLM = "a1b2c3d4e5f60002"
+S8_TOOL = "a1b2c3d4e5f60003"
+S8_EXEC = "a1b2c3d4e5f60004"
+S8_BLOCK = "a1b2c3d4e5f60005"
+S8_FOREIGN = "a1b2c3d4e5f60006"
+S8_LLM2 = "a1b2c3d4e5f60007"
+S8_HOOK = "a1b2c3d4e5f60008"
+S8_SESSION = "123e4567-e89b-12d3-a456-426614174000"
+S8_ACCOUNT = "5e1f2a3b-4c5d-4e6f-8a9b-0c1d2e3f4a5b"
+S8_MARKERS = (
+    "SYNTH_SECRET_0001",
+    "synth.user@example.test",
+    "000000000000",
+    "synth-host",
+    "synthetic",
+    "ENOENT",
+    S8_ACCOUNT,
+)
+S8_FLATTEN_KEYS = frozenset({
+    "lines_read", "malformed_lines", "spans", "skipped_items",
+    "dropped_attributes", "invalid_timestamps", "spans_over_limit",
+    "stream_truncated",
+})
+S8_MERGED_KEYS = frozenset(S8_FLATTEN_KEYS | {
+    "spans_in", "spans_out", "unknown_span_types", "invalid_ids",
+    "duplicate_spans", "invalid_status", "events_dropped",
+    "stripped_attributes", "unmapped_attributes", "unsafe_values",
+    "folded_spans", "orphan_folds", "reparented_spans",
+    "hook_spans", "content_attributes_seen",
+})
+
+
+def _s8_kv(key, value):
+    # One OTLP/JSON KeyValue with a typed AnyValue (str, int or bool).
+    if isinstance(value, bool):
+        typed = {"boolValue": value}
+    elif isinstance(value, int):
+        typed = {"intValue": value}
+    else:
+        typed = {"stringValue": value}
+    return {"key": key, "value": typed}
+
+
+def _s8_span(name, span_id, parent=None, attributes=None, status=None):
+    span = {
+        "traceId": S8_TRACE,
+        "spanId": span_id,
+        "name": name,
+        "startTimeUnixNano": "1767225600123456789",
+        "endTimeUnixNano": "1767225601987654321",
+        "attributes": [_s8_kv(k, v) for k, v in (attributes or {}).items()],
+        "events": [],
+    }
+    if parent is not None:
+        span["parentSpanId"] = parent
+    if status is not None:
+        span["status"] = status
+    return span
+
+
+def _s8_line(spans):
+    # One receiver JSONL line: one resourceSpans entry carrying identity keys.
+    resource = {"attributes": [_s8_kv(k, v) for k, v in {
+        "service.name": "claude-code",
+        "host.name": "synth-host",
+        "user.email": "synth.user@example.test",
+        "organization.id": "000000000000",
+        "user.account_uuid": S8_ACCOUNT,
+    }.items()]}
+    return json.dumps({"resourceSpans": [{
+        "resource": resource,
+        "scopeSpans": [{"spans": spans}],
+    }]})
+
+
+def _s8_lines(root_prompt="<REDACTED>"):
+    # Three lines. The tool.execution line comes BEFORE its parent's line.
+    exec_span = _s8_span(
+        "claude_code.tool.execution", S8_EXEC, parent=S8_TOOL,
+        attributes={
+            "success": False,
+            "error": "Error:ENOENT /home/synth/SYNTH_SECRET_0001",
+            "error_class": "ENOENT",
+        },
+        status={"code": 2, "message": "failed C:\\Users\\synthetic token=SYNTH_SECRET_0001"},
+    )
+    block_span = _s8_span(
+        "claude_code.tool.blocked_on_user", S8_BLOCK, parent=S8_TOOL,
+        attributes={"decision": "accept"},
+    )
+    root_span = _s8_span(
+        "claude_code.interaction", S8_ROOT,
+        attributes={
+            "session.id": S8_SESSION,
+            "interaction.sequence": 1,
+            "user_prompt": root_prompt,
+            "user.email": "synth.user@example.test",
+            "organization.id": "000000000000",
+            "user.account_uuid": S8_ACCOUNT,
+            "host.name": "synth-host",
+        },
+        status={"code": 1},
+    )
+    llm_span = _s8_span(
+        "claude_code.llm_request", S8_LLM, parent=S8_ROOT,
+        attributes={
+            "session.id": S8_SESSION,
+            "gen_ai.request.model": "claude-opus-4-1-20250805",
+            "input_tokens": 12,
+            "output_tokens": 34,
+            "cache_read_tokens": 5,
+            "cache_creation_tokens": 0,
+            "success": True,
+        },
+        status={"code": 1},
+    )
+    hook_span = _s8_span(
+        "claude_code.hook", S8_HOOK, parent=S8_ROOT,
+        attributes={"session.id": S8_SESSION}, status={"code": 1},
+    )
+    tool_span = _s8_span(
+        "claude_code.tool", S8_TOOL, parent=S8_ROOT,
+        attributes={
+            "session.id": S8_SESSION,
+            "tool_name_safe": "Read",
+            "tool_use_id": "toolu_01ABCdef",
+            "tool_input": "SYNTH_SECRET_0001",
+            "file_path": "C:\\Users\\synthetic\\x",
+        },
+    )
+    foreign_span = _s8_span("foreign.span", S8_FOREIGN, parent=S8_ROOT,
+                            status={"code": 1})
+    hostile_llm = _s8_span(
+        "claude_code.llm_request", S8_LLM2, parent=S8_FOREIGN,
+        attributes={
+            "session.id": S8_SESSION,
+            "model": "sk-ant-SYNTH_SECRET_0001",
+            "input_tokens": 5,
+            "success": True,
+        },
+        status={"code": 1},
+    )
+    return [
+        _s8_line([exec_span, block_span]),
+        _s8_line([root_span, llm_span, hook_span]),
+        _s8_line([tool_span, foreign_span, hostile_llm]),
+    ]
+
+
+def _s8_convert(lines):
+    from claude_code_plugin import mapping
+    return mapping.convert_lines(lines)
+
+
+class Step3RoundTripTests(unittest.TestCase):
+    """M7-B step 3 S8: convert_lines and serialize against the bridge and importer."""
+
+    def _main(self):
+        from claude_code_plugin import mapping
+        spans, counters = mapping.convert_lines(_s8_lines())
+        return spans, counters, mapping.serialize(spans)
+
+    def test_convert_lines_reparents_and_folds_on_main_fixture(self):
+        spans, counters, _raw = self._main()
+        by_id = {span["spanId"]: span for span in spans}
+        self.assertNotIn(S8_EXEC, by_id)
+        self.assertNotIn(S8_BLOCK, by_id)
+        self.assertNotIn(S8_FOREIGN, by_id)
+        self.assertEqual(by_id[S8_LLM2]["parentSpanId"], S8_ROOT)
+        self.assertEqual(by_id[S8_TOOL]["status"]["code"], 2)
+        self.assertEqual(by_id[S8_TOOL]["attributes"]["error.type"], "ToolError")
+        self.assertGreaterEqual(counters["reparented_spans"], 1)
+        self.assertEqual(counters["folded_spans"], 2)
+        self.assertEqual(counters["unknown_span_types"], 1)
+
+    def test_tripwires_on_main_fixture(self):
+        _spans, counters, _raw = self._main()
+        # Content keys placed: tool_input and file_path. user_prompt "<REDACTED>" is not counted.
+        self.assertEqual(counters["content_attributes_seen"], 2)
+        self.assertEqual(counters["hook_spans"], 1)
+
+    def test_tripwire_counts_non_redacted_user_prompt(self):
+        from claude_code_plugin import mapping
+        _spans, counters = mapping.convert_lines(_s8_lines(root_prompt="hello SYNTH"))
+        self.assertEqual(counters["content_attributes_seen"], 3)
+        self.assertEqual(counters["hook_spans"], 1)
+
+    def test_serialized_output_passes_bridge_source_parser(self):
+        _spans, _counters, raw = self._main()
+        kind, _parsed, documents, _normalization = bridge._parse_source_snapshot(raw, "claude-code")
+        self.assertEqual(kind, "spans")
+        self.assertTrue(documents)
+        for document in documents:
+            bridge.validate_artifact(document, mapper.canonical_bytes(document))
+
+    def test_importer_accepts_serialized_output(self):
+        from agentscope_importer import importer, ledger
+        _spans, _counters, raw = self._main()
+        conn = ledger.open_ledger(":memory:")
+        try:
+            receipt = importer.import_bytes(conn, raw, "claude-code")
+        finally:
+            conn.close()
+        self.assertNotIn(receipt["quality"], ("invalid", "unsupported"))
+
+    def test_mapped_documents_have_tool_and_llm_blocks(self):
+        _spans, _counters, raw = self._main()
+        _kind, _parsed, documents, _normalization = bridge._parse_source_snapshot(raw, "claude-code")
+        all_spans = [span for document in documents for span in document["spans"]]
+        tool_spans = [span for span in all_spans if span["kind"] == "tool"]
+        llm_spans = [span for span in all_spans if span["kind"] == "llm"]
+        self.assertTrue(any("tool" in span for span in tool_spans))
+        self.assertTrue(any("llm" in span for span in llm_spans))
+
+    def test_no_marker_in_raw_documents_receipt_or_counters(self):
+        from agentscope_importer import importer, ledger
+        _spans, counters, raw = self._main()
+        _kind, _parsed, documents, _normalization = bridge._parse_source_snapshot(raw, "claude-code")
+        conn = ledger.open_ledger(":memory:")
+        try:
+            receipt = importer.import_bytes(conn, raw, "claude-code")
+        finally:
+            conn.close()
+        raw_text = raw.decode("ascii")
+        # Fixture sanity: the markers really are in the input lines.
+        input_text = "\n".join(_s8_lines())
+        for marker in S8_MARKERS:
+            self.assertIn(marker, input_text, marker)
+        documents_text = json.dumps(documents, sort_keys=True)
+        for marker in S8_MARKERS:
+            self.assertNotIn(marker, raw_text, marker)
+            self.assertNotIn(marker, documents_text, marker)
+            self.assertNotIn(marker, repr(receipt), marker)
+            self.assertNotIn(marker, repr(counters), marker)
+
+    def test_convert_twice_gives_byte_identical_serialization(self):
+        from claude_code_plugin import mapping
+        first = mapping.serialize(mapping.convert_lines(_s8_lines())[0])
+        second = mapping.serialize(mapping.convert_lines(_s8_lines())[0])
+        self.assertIsInstance(first, bytes)
+        self.assertEqual(first, second)
+
+    def test_counters_are_ints_with_exact_merged_keys(self):
+        from claude_code_plugin import mapping
+        _spans, counters = mapping.convert_lines(_s8_lines())
+        self.assertEqual(set(counters), set(S8_MERGED_KEYS))
+        self.assertEqual(len(counters), len(S8_FLATTEN_KEYS) + len(mapping.COUNTER_KEYS) + 2)
+        for key, value in counters.items():
+            self.assertIs(type(value), int, key)
+
+    def test_flatten_and_mapping_counter_names_do_not_collide(self):
+        from claude_code_plugin import mapping
+        flatten_keys = set(flatten_lines([])[1])
+        self.assertEqual(flatten_keys, set(S8_FLATTEN_KEYS))
+        self.assertEqual(flatten_keys & set(mapping.COUNTER_KEYS), set())
+
+    def test_serialize_is_compact_sorted_ascii(self):
+        from claude_code_plugin import mapping
+        spans, _counters = mapping.convert_lines(_s8_lines())
+        raw = mapping.serialize(spans)
+        expected = json.dumps(
+            spans, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("ascii")
+        self.assertEqual(raw, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
