@@ -668,5 +668,81 @@ class LiveClaudeCodeShapeTests(unittest.TestCase):
                 )
 
 
+class LiveClaudeCodeGapTests(unittest.TestCase):
+    """Review G2-B23-P3-03: live Claude Code delivery gaps.
+
+    Each case must be refused before any import or delivery; where the
+    refusing check is specific, its message is asserted too.
+    """
+
+    def setUp(self):
+        self.conn = ledger.open_ledger(":memory:")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def assert_refused(self, raw, producer="claude-code", message=None):
+        with patch.object(bridge, "_deliver_document") as send, \
+                patch.object(bridge, "import_bytes", wraps=bridge.import_bytes) as imported:
+            with self.assertRaises(BridgeError) as caught:
+                deliver_snapshot(
+                    self.conn, raw, producer, "http://127.0.0.1:8765",
+                    "fake-token", live=True,
+                )
+        imported.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(ledger.counts(self.conn)["imports"], 0)
+        text = str(caught.exception)
+        if message is not None:
+            self.assertIn(message, text)
+        return text
+
+    def test_refuses_wrong_observation_source(self):
+        spans = claude_code_spans()
+        spans[1]["attributes"]["observation.source"] = "hook"
+        self.assert_refused(
+            cc_mapping.serialize(spans),
+            message="observation.source otel-export",
+        )
+
+    def test_refuses_array_with_non_object_entry(self):
+        raw = json.dumps(claude_code_spans() + [None], sort_keys=True).encode()
+        message = self.assert_refused(raw)
+        self.assertTrue(message)
+
+    def test_refuses_metric_and_log_records_in_array(self):
+        # Imported here: the real-exporter module imports this module at
+        # top level, so a module-level import would be circular.
+        from tests.test_agentscope_bridge_real_exporter import log_record, metric_record
+        for label, record in (("metric", metric_record()), ("log", log_record())):
+            with self.subTest(record=label):
+                raw = json.dumps(claude_code_spans() + [record], sort_keys=True).encode()
+                self.assert_refused(raw)
+
+    def test_refuses_otlp_payload_carrying_adapter_markers(self):
+        spans = claude_code_spans()
+        # The adapter's string status is not an OTLP status object; give each
+        # span one so the refusal comes from the adapter-marker check.
+        for span in spans:
+            span["status"] = {"code": 1}
+        payload = copilot_otlp(spans)
+        self.assert_refused(
+            json.dumps(payload).encode(),
+            message="python -m claude_code_plugin convert",
+        )
+
+    def test_marker_refusal_does_not_echo_canary_values(self):
+        canaries = (
+            ("agent.name", "CANARY-AGENT-5d1e"),
+            ("observation.source", "CANARY-SRC-5d1e"),
+        )
+        for key, value in canaries:
+            with self.subTest(key=key):
+                spans = claude_code_spans()
+                spans[1]["attributes"][key] = value
+                message = self.assert_refused(cc_mapping.serialize(spans))
+                self.assertNotIn(value, message)
+
+
 if __name__ == "__main__":
     unittest.main()
