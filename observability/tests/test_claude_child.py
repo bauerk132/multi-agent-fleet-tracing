@@ -390,9 +390,9 @@ class ClaudeChildTestCase(unittest.TestCase):
         )
         try:
             urllib.request.urlopen(req, timeout=10)
-            self.fail("expected HTTP 400 for non-JSON payload")
+            self.fail("expected HTTP 415 for protobuf payload")
         except urllib.error.HTTPError as exc:
-            self.assertEqual(exc.code, 400)
+            self.assertEqual(exc.code, 415)
         self.assertEqual(len(self.recv.spans), before)
         self.assertEqual(len(self.recv.rejected), 1)
         self.assertEqual(

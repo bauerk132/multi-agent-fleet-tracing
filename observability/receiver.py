@@ -142,7 +142,9 @@ class LocalReceiver:
                 self._preflight_done = False
                 self._preflight_accepted = False
                 self._validated_length = None
+                self._normalized_length = None
                 self._encoding_metadata = None
+                self._media_type_metadata = None
                 return super().handle_one_request()
 
             def _send_json(self, code, obj):
@@ -156,34 +158,22 @@ class LocalReceiver:
             def _record_rejection(self, length, reason, encoding=None):
                 with receiver._lock:
                     receiver.rejected.append({
-                        "content_type": None,
+                        "content_type": self._media_type_metadata,
                         "length": length,
-                        "encoding": encoding,
+                        "encoding": encoding if encoding is not None else self._encoding_metadata,
                         "reason": reason,
                     })
 
             def _refuse(self, code, reason, length=None):
                 self.close_connection = True
-                self._record_rejection(
-                    length, reason, getattr(self, "_encoding_metadata", None)
-                )
+                if length is None:
+                    length = self._normalized_length
+                self._record_rejection(length, reason)
                 self._send_json(code, {"error": reason})
                 return False
 
             def _preflight(self):
-                """Validate HTTP framing before any request body read."""
-                encodings = self.headers.get_all("Content-Encoding", [])
-                if not encodings:
-                    self._encoding_metadata = None
-                elif len(encodings) == 1:
-                    encoding = encodings[0].strip(" \t").lower()
-                    self._encoding_metadata = encoding if encoding in ("identity", "gzip") else "unsupported"
-                    if encoding != "identity":
-                        return self._refuse(415, "unsupported_encoding")
-                else:
-                    self._encoding_metadata = "unsupported"
-                    return self._refuse(415, "unsupported_encoding")
-
+                """Validate HTTP framing and headers before reading the body."""
                 transfer_encoding = self.headers.get_all("Transfer-Encoding", [])
                 if transfer_encoding:
                     return self._refuse(411, "unsupported_transfer_encoding")
@@ -205,6 +195,34 @@ class LocalReceiver:
                     return self._refuse(413, "body_too_large")
                 length = int(significant)
                 self._validated_length = length
+                self._normalized_length = length
+
+                encodings = self.headers.get_all("Content-Encoding", [])
+                if not encodings:
+                    self._encoding_metadata = None
+                elif len(encodings) == 1:
+                    encoding = encodings[0].strip(" \t").lower()
+                    self._encoding_metadata = encoding if encoding in ("identity", "gzip") else "unsupported"
+                    if encoding != "identity":
+                        return self._refuse(415, "unsupported_encoding")
+                else:
+                    self._encoding_metadata = "unsupported"
+                    return self._refuse(415, "unsupported_encoding")
+
+                types = self.headers.get_all("Content-Type", [])
+                if not types:
+                    self._media_type_metadata = None
+                    return self._refuse(415, "unsupported_content_type")
+                if len(types) != 1:
+                    self._media_type_metadata = "unsupported"
+                    return self._refuse(415, "unsupported_content_type")
+                media_type = types[0].split(";", 1)[0].strip(" \t").lower()
+                if media_type in ("application/json", "application/x-protobuf"):
+                    self._media_type_metadata = media_type
+                else:
+                    self._media_type_metadata = "unsupported"
+                if media_type != "application/json":
+                    return self._refuse(415, "unsupported_content_type")
                 return True
 
             def handle_expect_100(self):

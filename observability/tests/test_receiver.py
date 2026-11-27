@@ -129,11 +129,13 @@ class ReceiverEncodingTests(unittest.TestCase):
     def tearDown(self):
         self.receiver.stop()
 
-    def _send(self, headers, body=b'{"resourceSpans": []}', declared_length=None):
+    def _send(self, headers, body=b'{"resourceSpans": []}', declared_length=None,
+              content_types=("application/json",)):
         sock = socket.create_connection(("127.0.0.1", self.receiver.port), timeout=2)
         sock.settimeout(2)
         try:
-            lines = ["POST /v1/traces HTTP/1.1", "Host: localhost", "Content-Type: application/json"]
+            lines = ["POST /v1/traces HTTP/1.1", "Host: localhost"]
+            lines.extend(f"Content-Type: {value}" for value in content_types)
             lines.extend(headers)
             length = len(body) if declared_length is None else declared_length
             lines.append(f"Content-Length: {length}")
@@ -183,6 +185,62 @@ class ReceiverEncodingTests(unittest.TestCase):
             self.assertIn(b" 411 ", response)
         finally:
             sock.close()
+
+
+class ReceiverMediaTypeTests(unittest.TestCase):
+    def setUp(self):
+        self.receiver = LocalReceiver().start()
+
+    def tearDown(self):
+        self.receiver.stop()
+
+    def _send(self, content_types, body=None, declared_length=128):
+        sock = socket.create_connection(("127.0.0.1", self.receiver.port), timeout=2)
+        sock.settimeout(2)
+        try:
+            lines = ["POST /v1/traces HTTP/1.1", "Host: localhost"]
+            lines.extend(f"Content-Type: {value}" for value in content_types)
+            lines.append(f"Content-Length: {declared_length}")
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + (body or b""))
+            return _receive_response(sock).split(b"\r\n", 1)[0]
+        finally:
+            sock.close()
+
+    def test_missing_media_type_is_rejected_before_read(self):
+        status = self._send([])
+        self.assertIn(b" 415 ", status)
+
+    def test_protobuf_is_rejected_before_read_and_preserved_as_metadata(self):
+        status = self._send(["application/x-protobuf"])
+        self.assertIn(b" 415 ", status)
+        self.assertEqual(self.receiver.rejected[-1]["content_type"], "application/x-protobuf")
+
+    def test_unsupported_media_type_is_rejected_before_read(self):
+        status = self._send(["text/plain"])
+        self.assertIn(b" 415 ", status)
+
+    def test_repeated_media_type_is_rejected_before_read(self):
+        status = self._send(["application/json", "application/json"])
+        self.assertIn(b" 415 ", status)
+
+    def test_transfer_encoding_precedes_other_unsupported_headers(self):
+        sock = socket.create_connection(("127.0.0.1", self.receiver.port), timeout=2)
+        sock.settimeout(2)
+        try:
+            sock.sendall(("POST /v1/traces HTTP/1.1\r\nHost: localhost\r\n"
+                          "Transfer-Encoding: chunked\r\n"
+                          "Content-Encoding: gzip\r\n"
+                          "Content-Type: text/plain\r\n\r\n").encode("ascii"))
+            self.assertIn(b" 411 ", _receive_response(sock).split(b"\r\n", 1)[0])
+        finally:
+            sock.close()
+
+    def test_json_and_json_with_charset_are_accepted(self):
+        payload = b'{"resourceSpans": []}'
+        for media in ("application/json", "application/json; charset=utf-8"):
+            with self.subTest(media=media):
+                status = self._send([media], body=payload, declared_length=len(payload))
+                self.assertIn(b" 200 ", status)
 
 
 if __name__ == "__main__":
