@@ -1891,7 +1891,7 @@ class Step3MapSpansCoreTests(unittest.TestCase):
             "duplicate_spans": 0, "invalid_status": 0, "events_dropped": 0,
             "stripped_attributes": 0, "unmapped_attributes": 0, "unsafe_values": 0,
             "folded_spans": 0, "orphan_folds": 0, "reparented_spans": 0,
-            "out_of_range_timestamps": 0,
+            "out_of_range_timestamps": 0, "cycle_breaks": 0,
         })
 
     def test_every_output_span_and_the_whole_list_pass_bridge_validation(self):
@@ -2821,7 +2821,7 @@ S8_MERGED_KEYS = frozenset(S8_FLATTEN_KEYS | {
     "duplicate_spans", "invalid_status", "events_dropped",
     "stripped_attributes", "unmapped_attributes", "unsafe_values",
     "folded_spans", "orphan_folds", "reparented_spans",
-    "out_of_range_timestamps",
+    "out_of_range_timestamps", "cycle_breaks",
     "hook_spans", "content_attributes_seen",
 })
 
@@ -3058,6 +3058,225 @@ class Step3RoundTripTests(unittest.TestCase):
             spans, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
         ).encode("ascii")
         self.assertEqual(raw, expected)
+
+
+def _assert_no_parent_cycle(test, spans):
+    # Linear walk over the output parent links; fails the test on any cycle.
+    by_key = {(s["traceId"], s["spanId"]): s for s in spans}
+    done = set()
+    for start in by_key:
+        path = []
+        on_path = set()
+        key = start
+        while key is not None and key not in done:
+            if key in on_path:
+                test.fail("parent cycle through span %r" % (key[1],))
+            on_path.add(key)
+            path.append(key)
+            parent = by_key[key].get("parentSpanId")
+            if parent is None or (key[0], parent) not in by_key:
+                key = None
+            else:
+                key = (key[0], parent)
+        done.update(path)
+
+
+class Step3CycleBreakTests(unittest.TestCase):
+    """M7-B step 3 S12: a parent cycle among kept spans is broken at its smallest spanId."""
+
+    def _by_id(self, spans, trace_id=S4_TRACE):
+        return {s["spanId"]: s for s in spans if s["traceId"] == trace_id}
+
+    def _through_dropped_records(self):
+        # A -> X (dropped) -> B -> Y (dropped) -> A, all in S4_TRACE.
+        return [
+            _s7_llm(_sid(1), parent=_sid(3)),       # A
+            _s7_unknown(_sid(3), parent=_sid(2)),   # X, dropped
+            _s7_llm(_sid(2), parent=_sid(4)),       # B
+            _s7_unknown(_sid(4), parent=_sid(1)),   # Y, dropped
+        ]
+
+    def test_direct_two_cycle_breaks_at_smaller_span_id(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1), parent=_sid(2)),
+            _s7_llm(_sid(2), parent=_sid(1)),
+        ])
+        by_id = self._by_id(spans)
+        self.assertNotIn("parentSpanId", by_id[_sid(1)])
+        self.assertEqual(by_id[_sid(2)]["parentSpanId"], _sid(1))
+        self.assertEqual(counters["cycle_breaks"], 1)
+        self.assertEqual(counters["reparented_spans"], 0)
+        _assert_no_parent_cycle(self, spans)
+
+    def test_two_cycle_through_dropped_spans_is_broken(self):
+        spans, counters = _map_spans(self._through_dropped_records())
+        by_id = self._by_id(spans)
+        self.assertEqual(len(spans), 2)
+        self.assertNotIn("parentSpanId", by_id[_sid(1)])
+        self.assertEqual(by_id[_sid(2)]["parentSpanId"], _sid(1))
+        self.assertEqual(counters["cycle_breaks"], 1)
+        _assert_no_parent_cycle(self, spans)
+
+    def test_three_cycle_breaks_at_smallest_and_others_keep_parents(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1), parent=_sid(2)),
+            _s7_llm(_sid(2), parent=_sid(3)),
+            _s7_llm(_sid(3), parent=_sid(1)),
+        ])
+        by_id = self._by_id(spans)
+        self.assertNotIn("parentSpanId", by_id[_sid(1)])
+        self.assertEqual(by_id[_sid(2)]["parentSpanId"], _sid(3))
+        self.assertEqual(by_id[_sid(3)]["parentSpanId"], _sid(1))
+        self.assertEqual(counters["cycle_breaks"], 1)
+        _assert_no_parent_cycle(self, spans)
+
+    def test_two_cycles_in_one_trace_count_two(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1), parent=_sid(2)),
+            _s7_llm(_sid(2), parent=_sid(1)),
+            _s7_llm(_sid(3), parent=_sid(4)),
+            _s7_llm(_sid(4), parent=_sid(3)),
+        ])
+        by_id = self._by_id(spans)
+        self.assertNotIn("parentSpanId", by_id[_sid(1)])
+        self.assertNotIn("parentSpanId", by_id[_sid(3)])
+        self.assertEqual(by_id[_sid(2)]["parentSpanId"], _sid(1))
+        self.assertEqual(by_id[_sid(4)]["parentSpanId"], _sid(3))
+        self.assertEqual(counters["cycle_breaks"], 2)
+        _assert_no_parent_cycle(self, spans)
+
+    def test_one_cycle_in_each_of_two_traces_count_two(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1), parent=_sid(2)),
+            _s7_llm(_sid(2), parent=_sid(1)),
+            _s7_llm(_sid(1), parent=_sid(2), trace_id=S7_TRACE_2),
+            _s7_llm(_sid(2), parent=_sid(1), trace_id=S7_TRACE_2),
+        ])
+        self.assertEqual(len(spans), 4)
+        self.assertNotIn("parentSpanId", self._by_id(spans, S4_TRACE)[_sid(1)])
+        self.assertNotIn("parentSpanId", self._by_id(spans, S7_TRACE_2)[_sid(1)])
+        self.assertEqual(self._by_id(spans, S7_TRACE_2)[_sid(2)]["parentSpanId"], _sid(1))
+        self.assertEqual(counters["cycle_breaks"], 2)
+        _assert_no_parent_cycle(self, spans)
+
+    def test_tail_span_under_cycle_keeps_its_parent(self):
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1), parent=_sid(2)),
+            _s7_llm(_sid(2), parent=_sid(1)),
+            _s7_llm(_sid(3), parent=_sid(2)),
+        ])
+        by_id = self._by_id(spans)
+        self.assertNotIn("parentSpanId", by_id[_sid(1)])
+        self.assertEqual(by_id[_sid(2)]["parentSpanId"], _sid(1))
+        self.assertEqual(by_id[_sid(3)]["parentSpanId"], _sid(2))
+        self.assertEqual(counters["cycle_breaks"], 1)
+        _assert_no_parent_cycle(self, spans)
+
+    def test_tail_with_smallest_id_walked_first_is_not_chosen_as_root(self):
+        # The walk starts at the tail (input order), and the tail has the
+        # smallest spanId; only cycle members may be made a root.
+        spans, counters = _map_spans([
+            _s7_llm(_sid(1), parent=_sid(2)),
+            _s7_llm(_sid(2), parent=_sid(3)),
+            _s7_llm(_sid(3), parent=_sid(2)),
+        ])
+        by_id = self._by_id(spans)
+        self.assertEqual(by_id[_sid(1)]["parentSpanId"], _sid(2))
+        self.assertNotIn("parentSpanId", by_id[_sid(2)])
+        self.assertEqual(by_id[_sid(3)]["parentSpanId"], _sid(2))
+        self.assertEqual(counters["cycle_breaks"], 1)
+        _assert_no_parent_cycle(self, spans)
+
+    def test_healthy_tree_is_unchanged(self):
+        spans, counters = _map_spans([
+            _rec("claude_code.interaction", _sid(1)),
+            _s7_llm(_sid(2), parent=_sid(1)),
+            _s7_llm(_sid(3), parent=_sid(1)),
+            _s7_llm(_sid(4), parent=_sid(1)),
+        ])
+        self.assertEqual(counters["cycle_breaks"], 0)
+        self.assertEqual(
+            {(s["spanId"], s.get("parentSpanId")) for s in spans},
+            {(_sid(1), None), (_sid(2), _sid(1)), (_sid(3), _sid(1)), (_sid(4), _sid(1))},
+        )
+        _assert_no_parent_cycle(self, spans)
+
+    def test_result_does_not_depend_on_input_order(self):
+        records = self._through_dropped_records() + [
+            _s7_llm(_sid(5), parent=_sid(6)),
+            _s7_llm(_sid(6), parent=_sid(5)),
+            _s7_llm(_sid(7), parent=_sid(2)),
+        ]
+        orders = [
+            list(records),
+            list(reversed(records)),
+            records[2:] + records[:2],
+            records[3:] + records[:3],
+        ]
+        results = []
+        for order in orders:
+            spans, counters = _map_spans(order)
+            self.assertEqual(counters["cycle_breaks"], 2)
+            _assert_no_parent_cycle(self, spans)
+            results.append({(s["spanId"], s.get("parentSpanId")) for s in spans})
+        for result in results[1:]:
+            self.assertEqual(result, results[0])
+
+    def test_long_kept_cycle_of_10000_spans_does_not_recurse(self):
+        count = 10000
+        ids = [_sid(k) for k in range(1, count + 1)]
+        records = [_s7_llm(ids[k], parent=ids[(k + 1) % count]) for k in range(count)]
+        spans, counters = _map_spans(records)
+        self.assertEqual(len(spans), count)
+        self.assertEqual(counters["cycle_breaks"], 1)
+        self.assertNotIn("parentSpanId", self._by_id(spans)[ids[0]])
+        _assert_no_parent_cycle(self, spans)
+
+    def test_span_conservation_holds_with_cycles(self):
+        records = self._through_dropped_records() + [
+            _s7_llm(_sid(5), parent=_sid(6)),
+            _s7_llm(_sid(6), parent=_sid(5)),
+            _s7_unknown(_sid(8)),
+            _rec("claude_code.llm_request", "xyz"),
+            _s7_llm(_sid(5), parent=_sid(6)),
+            _rec("claude_code.tool.execution", _sid(9)),
+        ]
+        spans, counters = _map_spans(records)
+        self.assertEqual(counters["spans_in"], len(records))
+        self.assertEqual(counters["spans_in"], (
+            counters["spans_out"] + counters["unknown_span_types"]
+            + counters["invalid_ids"] + counters["duplicate_spans"]
+            + counters["folded_spans"] + counters["orphan_folds"]
+        ))
+        self.assertEqual(counters["cycle_breaks"], 2)
+        _assert_no_parent_cycle(self, spans)
+
+    def test_cycle_breaks_is_a_counter_key_and_int_everywhere(self):
+        from claude_code_plugin import mapping
+        self.assertEqual(mapping.COUNTER_KEYS[-1], "cycle_breaks")
+        for records in ([], [_s7_llm(_sid(1))], self._through_dropped_records()):
+            _spans, counters = _map_spans(records)
+            self.assertIs(type(counters["cycle_breaks"]), int)
+
+    def test_end_to_end_cycle_no_longer_makes_trace_invalid(self):
+        from claude_code_plugin import mapping
+        from agentscope_importer import importer as importer_module
+        from agentscope_importer import ledger as ledger_module
+        root = _s8_span("claude_code.interaction", _sid(1))
+        children = [_s8_span("claude_code.llm_request", _sid(n), parent=_sid(1)) for n in (2, 3, 4)]
+        cycle = [
+            _s8_span("claude_code.llm_request", _sid(5), parent=_sid(6)),
+            _s8_span("claude_code.llm_request", _sid(6), parent=_sid(5)),
+        ]
+        spans, counters = mapping.convert_lines([_s8_line([root] + children + cycle)])
+        self.assertEqual(len(spans), 6)
+        self.assertEqual(counters["cycle_breaks"], 1)
+        raw = mapping.serialize(spans)
+        result = importer_module.import_bytes(
+            ledger_module.open_ledger(":memory:"), raw, "claude-code",
+        )
+        self.assertEqual(result["quality"], "complete")
+        self.assertEqual(result["stats"]["spans"], len(spans))
 
 
 class Step3TimestampBoundTests(unittest.TestCase):

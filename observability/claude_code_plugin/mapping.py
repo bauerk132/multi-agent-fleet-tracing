@@ -126,6 +126,9 @@ to the nearest kept ancestor, so the output tree stays connected.
     once in reparented_spans. A root is represented by the absence of the
     parentSpanId key.
 - Output order is unchanged, and every span is still a flat v1 span.
+- A parent cycle among kept spans (left after re-parenting, directly or through
+  dropped spans) is broken by making the cycle's smallest spanId a root, counted
+  once per cycle in cycle_breaks (S12).
 
 What S8 adds: convert_lines(lines) runs adapter.flatten_lines and then map_spans,
 and returns one merged counters dict (the flatten counters, the mapping counters
@@ -138,7 +141,8 @@ value is not exactly "<REDACTED>".
 
 Counters: spans_in (every record), spans_out, unknown_span_types, invalid_ids,
 duplicate_spans, invalid_status, events_dropped, stripped_attributes,
-unmapped_attributes, unsafe_values, folded_spans, orphan_folds, reparented_spans.
+unmapped_attributes, unsafe_values, folded_spans, orphan_folds, reparented_spans,
+out_of_range_timestamps (S11), cycle_breaks (S12).
 
 Never raises on any record shape: every decision is an explicit type check.
 """
@@ -198,6 +202,7 @@ COUNTER_KEYS = (
     "orphan_folds",
     "reparented_spans",
     "out_of_range_timestamps",
+    "cycle_breaks",
 )
 
 # Rank of each outcome when a parent has several (S6): the highest wins.
@@ -446,6 +451,49 @@ def _reparent(spans, parent_map, counters):
         counters["reparented_spans"] += 1
 
 
+_UNSEEN, _ON_PATH, _DONE = 0, 1, 2
+
+
+def _break_cycles(spans, counters):
+    """Break every parent cycle among kept spans, in place (S12).
+
+    Kept spans are indexed by (traceId, spanId). A span's parent edge counts only
+    when (traceId, parentSpanId) is a kept span in the same trace; any other
+    parent ends the walk. For each cycle, its member with the smallest spanId
+    (plain str comparison) becomes a root by deleting its parentSpanId, and
+    cycle_breaks grows by one. Spans that hang off a cycle keep their parents.
+    The walk is iterative and each span is visited once, so the cost is O(n).
+    Each span has at most one parent, so cycles are disjoint and each is found
+    exactly once; the result does not depend on the input order.
+    """
+    index = {(span["traceId"], span["spanId"]): span for span in spans}
+    state = {}
+    for start in index:
+        if start in state:
+            continue
+        path = []
+        key = start
+        while key is not None:
+            status = state.get(key, _UNSEEN)
+            if status == _DONE:
+                break
+            if status == _ON_PATH:
+                members = path[path.index(key):]
+                root = min(members, key=lambda member: member[1])
+                del index[root]["parentSpanId"]
+                counters["cycle_breaks"] += 1
+                break
+            state[key] = _ON_PATH
+            path.append(key)
+            parent = index[key].get("parentSpanId")
+            if parent is None or (key[0], parent) not in index:
+                key = None
+            else:
+                key = (key[0], parent)
+        for node in path:
+            state[node] = _DONE
+
+
 def map_spans(records):
     """Map flatten_lines span records to flat v1 spans. Returns (spans, counters).
 
@@ -458,9 +506,11 @@ def map_spans(records):
     int keys spans_in, spans_out, unknown_span_types, invalid_ids,
     duplicate_spans, invalid_status, events_dropped, stripped_attributes,
     unmapped_attributes, unsafe_values, folded_spans, orphan_folds,
-    reparented_spans and out_of_range_timestamps, all always present. An int
-    time outside 0..MAX_TIME_NS is counted once per field in
-    out_of_range_timestamps; a missing or non-int time is not counted.
+    reparented_spans, out_of_range_timestamps and cycle_breaks, all always
+    present. An int time outside 0..MAX_TIME_NS is counted once per field in
+    out_of_range_timestamps; a missing or non-int time is not counted. A parent
+    cycle among the kept spans is broken by making its smallest spanId a root
+    (S12), and each cycle broken counts once in cycle_breaks.
 
     Routing is by record["name"] only (see the module docstring). Status
     messages from the source are never read or copied. For each kept span, the
@@ -596,6 +646,7 @@ def map_spans(records):
         _apply_final(out, final)
 
     _reparent(spans, parent_map, counters)
+    _break_cycles(spans, counters)
     counters["spans_out"] = len(spans)
     return spans, counters
 
