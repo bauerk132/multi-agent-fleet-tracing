@@ -126,14 +126,21 @@ class LocalReceiver:
 
     def _handle_payload(self, payload):
         with self._lock:
+            flattened = flatten_payload(payload)
             self.payloads.append(payload)
-            self.spans.extend(flatten_payload(payload))
+            self.spans.extend(flattened)
         if self.out_path is not None:
             self.out_path.parent.mkdir(parents=True, exist_ok=True)
             with self.out_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(payload) + "\n")
 
     def start(self):
+        bind_host = self.host
+        if bind_host not in ("127.0.0.1", "::1", "localhost"):
+            raise ValueError("unsupported bind host")
+        if bind_host == "localhost":
+            bind_host = "127.0.0.1"
+        self.host = bind_host
         receiver = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -147,6 +154,7 @@ class LocalReceiver:
                 self._preflight_accepted = False
                 self._validated_length = None
                 self._normalized_length = None
+                self._declared_body_too_large = False
                 self._encoding_metadata = None
                 self._media_type_metadata = None
                 return super().handle_one_request()
@@ -178,11 +186,53 @@ class LocalReceiver:
 
             def _preflight(self):
                 """Validate HTTP framing and headers before reading the body."""
+                values = self.headers.get_all("Content-Length", [])
+                if len(values) == 1:
+                    raw_length = values[0].strip(" \t")
+                    if raw_length and re.fullmatch(r"[0-9]+", raw_length, flags=re.ASCII) is not None:
+                        significant = raw_length.lstrip("0") or "0"
+                        cap_digits = str(MAX_BODY_BYTES)
+                        if len(significant) > 18:
+                            self._normalized_length = "over_range"
+                            self._declared_body_too_large = True
+                        else:
+                            self._declared_body_too_large = (
+                                len(significant) > len(cap_digits)
+                                or (
+                                    len(significant) == len(cap_digits)
+                                    and significant > cap_digits
+                                )
+                            )
+                            self._normalized_length = int(significant)
+
+                encodings = self.headers.get_all("Content-Encoding", [])
+                if not encodings:
+                    self._encoding_metadata = None
+                elif len(encodings) != 1:
+                    self._encoding_metadata = "unsupported"
+                else:
+                    encoding = encodings[0].strip(" \t").lower()
+                    self._encoding_metadata = (
+                        encoding if encoding in ("identity", "gzip") else "unsupported"
+                    )
+
+                types = self.headers.get_all("Content-Type", [])
+                if not types:
+                    self._media_type_metadata = None
+                elif len(types) != 1:
+                    self._media_type_metadata = "unsupported"
+                else:
+                    media_type = types[0].split(";", 1)[0].strip(" \t").lower()
+                    self._media_type_metadata = (
+                        media_type
+                        if media_type in ("application/json", "application/x-protobuf")
+                        else "unsupported"
+                    )
+
                 transfer_encoding = self.headers.get_all("Transfer-Encoding", [])
                 if transfer_encoding:
                     return self._refuse(411, "unsupported_transfer_encoding")
 
-                values = self.headers.get_all("Content-Length", [])
                 if not values:
                     return self._refuse(411, "length_required")
                 if len(values) != 1:
@@ -192,40 +242,16 @@ class LocalReceiver:
                 if not raw_length or re.fullmatch(r"[0-9]+", raw_length, flags=re.ASCII) is None:
                     return self._refuse(411, "invalid_length")
                 significant = raw_length.lstrip("0") or "0"
-                if len(significant) > len(str(MAX_BODY_BYTES)) or (
-                    len(significant) == len(str(MAX_BODY_BYTES))
-                    and significant > str(MAX_BODY_BYTES)
-                ):
+                if self._declared_body_too_large:
                     return self._refuse(413, "body_too_large")
                 length = int(significant)
                 self._validated_length = length
                 self._normalized_length = length
 
-                encodings = self.headers.get_all("Content-Encoding", [])
-                if not encodings:
-                    self._encoding_metadata = None
-                elif len(encodings) == 1:
-                    encoding = encodings[0].strip(" \t").lower()
-                    self._encoding_metadata = encoding if encoding in ("identity", "gzip") else "unsupported"
-                    if encoding != "identity":
-                        return self._refuse(415, "unsupported_encoding")
-                else:
-                    self._encoding_metadata = "unsupported"
+                if encodings and self._encoding_metadata != "identity":
                     return self._refuse(415, "unsupported_encoding")
 
-                types = self.headers.get_all("Content-Type", [])
-                if not types:
-                    self._media_type_metadata = None
-                    return self._refuse(415, "unsupported_content_type")
-                if len(types) != 1:
-                    self._media_type_metadata = "unsupported"
-                    return self._refuse(415, "unsupported_content_type")
-                media_type = types[0].split(";", 1)[0].strip(" \t").lower()
-                if media_type in ("application/json", "application/x-protobuf"):
-                    self._media_type_metadata = media_type
-                else:
-                    self._media_type_metadata = "unsupported"
-                if media_type != "application/json":
+                if not types or len(types) != 1 or self._media_type_metadata != "application/json":
                     return self._refuse(415, "unsupported_content_type")
                 return True
 
@@ -263,7 +289,7 @@ class LocalReceiver:
                     return
                 try:
                     payload = json.loads(raw.decode("utf-8"))
-                except (ValueError, UnicodeDecodeError):
+                except (ValueError, UnicodeDecodeError, RecursionError):
                     self._record_rejection(length, "invalid_json")
                     self.close_connection = True
                     self._send_json(400, {"error": "invalid JSON"})
@@ -273,7 +299,13 @@ class LocalReceiver:
                     self.close_connection = True
                     self._send_json(400, {"error": "not an OTLP traces payload"})
                     return
-                receiver._handle_payload(payload)
+                try:
+                    receiver._handle_payload(payload)
+                except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+                    self._record_rejection(length, "invalid_payload")
+                    self.close_connection = True
+                    self._send_json(400, {"error": "not an OTLP traces payload"})
+                    return
                 self._send_json(200, {})
 
             def do_GET(self):
@@ -292,14 +324,14 @@ class LocalReceiver:
                     return
                 self._send_json(404, {"error": "not found"})
 
-        if self.host == "::1":
+        if bind_host == "::1":
             class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
                 address_family = socket.AF_INET6
 
             server_type = IPv6ThreadingHTTPServer
         else:
             server_type = ThreadingHTTPServer
-        self._server = server_type((self.host, self.port), Handler)
+        self._server = server_type((bind_host, self.port), Handler)
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(
             target=self._server.serve_forever, daemon=True

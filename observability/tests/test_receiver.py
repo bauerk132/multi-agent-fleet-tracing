@@ -1,6 +1,11 @@
+import contextlib
+import io
+import json
+from pathlib import Path
 import socket
 import subprocess
 import sys
+import tempfile
 import unittest
 import urllib.request
 from unittest.mock import patch
@@ -70,12 +75,18 @@ class ReceiverBodyBoundsTests(unittest.TestCase):
         self.assertIn(b" 411 ", status)
 
     def test_invalid_content_length_is_rejected_before_body_read(self):
-        for value in ("+1", "-1", "1.0"):
+        for value in ("", "+1", "-1", "1.0", "1, 1"):
             with self.subTest(value=value):
                 status = self._post_headers([
                     "Content-Type: application/json", f"Content-Length: {value}"
                 ])
                 self.assertIn(b" 411 ", status)
+                self.assertEqual(self.receiver.rejected[-1], {
+                    "content_type": "application/json",
+                    "length": None,
+                    "encoding": None,
+                    "reason": "invalid_length",
+                })
 
     def test_declared_oversize_is_rejected_before_body_read(self):
         status = self._post_headers([
@@ -233,8 +244,15 @@ class ReceiverMediaTypeTests(unittest.TestCase):
             sock.sendall(("POST /v1/traces HTTP/1.1\r\nHost: localhost\r\n"
                           "Transfer-Encoding: chunked\r\n"
                           "Content-Encoding: gzip\r\n"
-                          "Content-Type: text/plain\r\n\r\n").encode("ascii"))
+                          "Content-Type: text/plain\r\n"
+                          "Content-Length: 7\r\n\r\n").encode("ascii"))
             self.assertIn(b" 411 ", _receive_response(sock).split(b"\r\n", 1)[0])
+            self.assertEqual(self.receiver.rejected[-1], {
+                "content_type": "unsupported",
+                "length": 7,
+                "encoding": "gzip",
+                "reason": "unsupported_transfer_encoding",
+            })
         finally:
             sock.close()
 
@@ -253,6 +271,14 @@ class ReceiverBindTests(unittest.TestCase):
                 with self.subTest(host=host):
                     with self.assertRaisesRegex(ValueError, "unsupported bind host"):
                         LocalReceiver(host=host)
+            server.assert_not_called()
+
+    def test_start_revalidates_a_mutated_host_before_server_creation(self):
+        receiver = LocalReceiver()
+        receiver.host = "0.0.0.0"
+        with patch("receiver.ThreadingHTTPServer") as server:
+            with self.assertRaisesRegex(ValueError, "unsupported bind host"):
+                receiver.start()
             server.assert_not_called()
 
     def test_cli_rejects_non_loopback_without_echoing_host(self):
@@ -290,6 +316,126 @@ class ReceiverBindTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
         finally:
             receiver.stop()
+
+
+class ReceiverPrivacyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sink = Path(self.tmp.name) / "received.jsonl"
+        self.receiver = LocalReceiver(out_path=self.sink).start()
+
+    def tearDown(self):
+        self.receiver.stop()
+        self.tmp.cleanup()
+
+    def _post(self, headers, body):
+        sock = socket.create_connection(("127.0.0.1", self.receiver.port), timeout=2)
+        sock.settimeout(2)
+        try:
+            lines = ["POST /v1/traces HTTP/1.1", "Host: localhost"]
+            lines.extend(headers)
+            lines.append(f"Content-Length: {len(body)}")
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body)
+            return _receive_response(sock)
+        finally:
+            sock.close()
+
+    def test_refusal_records_only_normalized_metadata(self):
+        marker = "SYNTHETIC-MARKER-493"
+        body = ("{\"probe\":\"" + marker + "\"}").encode("utf-8")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            response = self._post([
+                "Content-Type: application/x-protobuf; note=" + marker,
+                "X-Unrelated: " + marker,
+            ], body)
+        self.assertIn(b" 415 ", response.split(b"\r\n", 1)[0])
+        self.assertEqual(self.receiver.rejected, [{
+            "content_type": "application/x-protobuf",
+            "length": len(body),
+            "encoding": None,
+            "reason": "unsupported_content_type",
+        }])
+        self.assertNotIn(marker.encode(), response)
+        self.assertNotIn(marker, repr(self.receiver.rejected))
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertNotIn(marker, stderr.getvalue())
+        self.assertFalse(self.sink.exists())
+        with urllib.request.urlopen(self.receiver.endpoint.replace("/v1/traces", "/health"), timeout=2) as health_response:
+            health = health_response.read().decode("utf-8")
+        self.assertNotIn(marker, health)
+
+    def test_unsupported_encoding_records_only_fixed_metadata(self):
+        marker = "SYNTHETIC-HEADER-209"
+        body = marker.encode("ascii")
+        response = self._post([
+            "Content-Type: application/json; charset=" + marker,
+            "Content-Encoding: gzip",
+            "X-Unrelated: " + marker,
+        ], body)
+        self.assertIn(b" 415 ", response.split(b"\r\n", 1)[0])
+        self.assertEqual(self.receiver.rejected[-1], {
+            "content_type": "application/json",
+            "length": len(body),
+            "encoding": "gzip",
+            "reason": "unsupported_encoding",
+        })
+        self.assertNotIn(marker.encode("ascii"), repr(self.receiver.rejected).encode())
+
+    def test_extreme_length_uses_over_range_metadata_without_conversion(self):
+        sock = socket.create_connection(("127.0.0.1", self.receiver.port), timeout=2)
+        sock.settimeout(2)
+        try:
+            sock.sendall(("POST /v1/traces HTTP/1.1\r\nHost: localhost\r\n"
+                          "Content-Type: application/json\r\n"
+                          "Content-Length: 999999999999999999999999999999999999\r\n\r\n").encode("ascii"))
+            response = _receive_response(sock)
+            self.assertIn(b" 413 ", response.split(b"\r\n", 1)[0])
+        finally:
+            sock.close()
+        self.assertEqual(self.receiver.rejected[-1], {
+            "content_type": "application/json",
+            "length": "over_range",
+            "encoding": None,
+            "reason": "body_too_large",
+        })
+
+    def test_json_recursion_error_returns_fixed_rejection(self):
+        marker = "SYNTHETIC-JSON-811"
+        body = ("{\"resourceSpans\":[],\"marker\":\"" + marker + "\"}").encode()
+        with patch("receiver.json.loads", side_effect=RecursionError):
+            response = self._post(["Content-Type: application/json"], body)
+        self.assertIn(b" 400 ", response.split(b"\r\n", 1)[0])
+        self.assertNotIn(marker.encode(), response)
+        self.assertEqual(self.receiver.rejected[-1], {
+            "content_type": "application/json",
+            "length": len(body),
+            "encoding": None,
+            "reason": "invalid_json",
+        })
+
+    def test_malformed_nested_payload_is_rejected_without_partial_state(self):
+        body = b'{"resourceSpans":[{"scopeSpans":[{"spans":["nested-marker"]}]}]}'
+        response = self._post(["Content-Type: application/json"], body)
+        self.assertIn(b" 400 ", response.split(b"\r\n", 1)[0])
+        self.assertEqual(self.receiver.payloads, [])
+        self.assertEqual(self.receiver.spans, [])
+        self.assertFalse(self.sink.exists())
+        self.assertEqual(self.receiver.rejected[0]["reason"], "invalid_payload")
+        self.assertNotIn(b"nested-marker", response)
+
+    def test_valid_synthetic_payload_is_written_and_health_is_count_only(self):
+        marker = "SYNTHETIC-VALID-731"
+        body = json.dumps({"resourceSpans": [{"scopeSpans": [{"spans": [{"name": marker}]}]}]}).encode()
+        response = self._post(["Content-Type: application/json; charset=utf-8"], body)
+        self.assertIn(b" 200 ", response.split(b"\r\n", 1)[0])
+        self.assertNotIn(marker.encode(), response)
+        self.assertEqual(self.sink.read_text(encoding="utf-8"), body.decode() + "\n")
+        with urllib.request.urlopen(self.receiver.endpoint.replace("/v1/traces", "/health"), timeout=2) as health_response:
+            health = json.loads(health_response.read().decode("utf-8"))
+        self.assertEqual(health, {"status": "ok", "spans_received": 1, "payloads_received": 1})
+        self.assertNotIn(marker, json.dumps(health))
 
 
 if __name__ == "__main__":
