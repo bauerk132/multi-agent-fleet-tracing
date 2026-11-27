@@ -1,5 +1,8 @@
 import socket
+import subprocess
+import sys
 import unittest
+import urllib.request
 from unittest.mock import patch
 
 from receiver import LocalReceiver
@@ -241,6 +244,52 @@ class ReceiverMediaTypeTests(unittest.TestCase):
             with self.subTest(media=media):
                 status = self._send([media], body=payload, declared_length=len(payload))
                 self.assertIn(b" 200 ", status)
+
+
+class ReceiverBindTests(unittest.TestCase):
+    def test_constructor_rejects_non_loopback_before_socket_creation(self):
+        with patch("receiver.ThreadingHTTPServer") as server:
+            for host in ("0.0.0.0", "192.0.2.1", "example.invalid"):
+                with self.subTest(host=host):
+                    with self.assertRaisesRegex(ValueError, "unsupported bind host"):
+                        LocalReceiver(host=host)
+            server.assert_not_called()
+
+    def test_cli_rejects_non_loopback_without_echoing_host(self):
+        marker = "198.51.100.77"
+        result = subprocess.run(
+            [sys.executable, "-B", "receiver.py", "--host", marker],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("unsupported bind host", result.stderr)
+        self.assertNotIn(marker, result.stderr)
+
+    def test_ipv4_loopback_hosts_have_healthy_endpoints(self):
+        for host, endpoint_host in (("127.0.0.1", "127.0.0.1"), ("localhost", "127.0.0.1")):
+            with self.subTest(host=host):
+                receiver = LocalReceiver(host=host).start()
+                try:
+                    self.assertIn(f"http://{endpoint_host}:", receiver.endpoint)
+                    with urllib.request.urlopen(receiver.endpoint.replace("/v1/traces", "/health"), timeout=2) as response:
+                        self.assertEqual(response.status, 200)
+                finally:
+                    receiver.stop()
+
+    def test_ipv6_loopback_uses_bracketed_endpoint_and_health_url(self):
+        try:
+            receiver = LocalReceiver(host="::1").start()
+        except OSError as exc:
+            self.skipTest(f"IPv6 loopback unavailable: {type(exc).__name__}")
+        try:
+            self.assertIn("http://[::1]:", receiver.endpoint)
+            with urllib.request.urlopen(receiver.endpoint.replace("/v1/traces", "/health"), timeout=2) as response:
+                self.assertEqual(response.status, 200)
+        finally:
+            receiver.stop()
 
 
 if __name__ == "__main__":

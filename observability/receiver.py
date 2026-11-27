@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -102,7 +103,9 @@ class LocalReceiver:
     """A localhost OTLP/HTTP JSON receiver for tests and demos."""
 
     def __init__(self, host="127.0.0.1", port=0, out_path=None):
-        self.host = host
+        if host not in ("127.0.0.1", "::1", "localhost"):
+            raise ValueError("unsupported bind host")
+        self.host = "127.0.0.1" if host == "localhost" else host
         self.port = port
         self.out_path = Path(out_path) if out_path else None
         self._lock = threading.Lock()
@@ -118,7 +121,8 @@ class LocalReceiver:
 
     @property
     def endpoint(self):
-        return f"http://{self.host}:{self.port}/v1/traces"
+        display_host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"http://{display_host}:{self.port}/v1/traces"
 
     def _handle_payload(self, payload):
         with self._lock:
@@ -288,7 +292,14 @@ class LocalReceiver:
                     return
                 self._send_json(404, {"error": "not found"})
 
-        self._server = ThreadingHTTPServer((self.host, self.port), Handler)
+        if self.host == "::1":
+            class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+                address_family = socket.AF_INET6
+
+            server_type = IPv6ThreadingHTTPServer
+        else:
+            server_type = ThreadingHTTPServer
+        self._server = server_type((self.host, self.port), Handler)
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(
             target=self._server.serve_forever, daemon=True
@@ -315,8 +326,12 @@ if __name__ == "__main__":
     parser.add_argument("--out", default="out/received.jsonl")
     args = parser.parse_args()
 
-    recv = LocalReceiver(host=args.host, port=args.port, out_path=args.out).start()
-    print(f"listening on {recv.endpoint} (health: http://{args.host}:{recv.port}/health)")
+    try:
+        recv = LocalReceiver(host=args.host, port=args.port, out_path=args.out).start()
+    except ValueError:
+        parser.error("unsupported bind host")
+    display_host = f"[{recv.host}]" if ":" in recv.host else recv.host
+    print(f"listening on {recv.endpoint} (health: http://{display_host}:{recv.port}/health)")
     print(f"appending payloads to {args.out}")
     try:
         threading.Event().wait()
