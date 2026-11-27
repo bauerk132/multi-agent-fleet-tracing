@@ -977,7 +977,21 @@ def _validate_otlp_payload(payload):
     return flattened
 
 
-def _parse_source_snapshot(raw, producer, live=False):
+def _refuse_dropped_runs(mapped, strict):
+    """Strict (live) parsing refuses a snapshot whose runs the mapper dropped.
+
+    The mapper drops a trace with a duplicate span id or a parent cycle;
+    importing it anyway would write an invalid ledger row. Unreadable
+    entries are not refused here: real exporter files carry records the
+    importer already skips and counts.
+    """
+    if not strict:
+        return
+    if mapped["dropped"]:
+        raise BridgeError("live snapshot has a duplicate span id or a parent cycle; refused before import")
+
+
+def _parse_source_snapshot(raw, producer, live=False, *, strict=False):
     """Parse one bounded source snapshot into canonical documents.
 
     Live mode normalizes raw Copilot exporter observations before
@@ -996,7 +1010,9 @@ def _parse_source_snapshot(raw, producer, live=False):
     real-exporter accounting (records, metrics/logs skipped, spans
     accepted/rejected with reasons, error mappings, event sanitizing).
     For JSONL input, parsed is (kept_spans, unreadable_lines) with the
-    kept spans already normalized.
+    kept spans already normalized. When strict is True (live delivery),
+    a snapshot whose runs the mapper dropped is refused before any
+    document is built.
     """
     normalization = {
         "renamed_spans": 0,
@@ -1040,6 +1056,7 @@ def _parse_source_snapshot(raw, producer, live=False):
             normalization["dropped_attributes"] += dropped
         spans = _validate_otlp_payload(parsed)
         mapped = map_spans(spans, producer)
+        _refuse_dropped_runs(mapped, strict)
         documents = [document for _, document in mapped["documents"]]
         for document in documents:
             validate_artifact(document, canonical_bytes(document))
@@ -1049,6 +1066,7 @@ def _parse_source_snapshot(raw, producer, live=False):
             parsed = _normalize_live_records(parsed, normalization)
         _validate_flat_spans(parsed)
         mapped = map_spans(parsed, producer)
+        _refuse_dropped_runs(mapped, strict)
         documents = [document for _, document in mapped["documents"]]
         for document in documents:
             validate_artifact(document, canonical_bytes(document))
@@ -1072,6 +1090,7 @@ def _parse_source_snapshot(raw, producer, live=False):
     normalization["unreadable_lines"] = unreadable_lines
     _validate_flat_spans(spans)
     mapped = map_spans(spans, producer)
+    _refuse_dropped_runs(mapped, strict)
     documents = [document for _, document in mapped["documents"]]
     for document in documents:
         validate_artifact(document, canonical_bytes(document))
@@ -1861,6 +1880,8 @@ def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synth
     the requested producer. Live delivery never accepts a synthetic-only
     acknowledgment. Both acknowledgments must be exact booleans (True or
     False); anything else is refused before any import or delivery.
+    Live delivery also refuses, before any import, a snapshot with a
+    duplicate span id or a parent cycle.
     """
     if not isinstance(live, bool) or not isinstance(synthetic_only, bool):
         raise BridgeError("live and synthetic-only acknowledgments must be True or False")
@@ -1884,7 +1905,7 @@ def deliver_snapshot(conn, raw, producer, server, token, settings=None, *, synth
     settings = settings or ImportSettings()
     try:
         source_kind, parsed, documents, normalization = _parse_source_snapshot(
-            raw, producer, live=live and producer == "copilot"
+            raw, producer, live=live and producer == "copilot", strict=live
         )
         if live and producer == "claude-code":
             _check_live_claude_code_spans(source_kind, parsed)

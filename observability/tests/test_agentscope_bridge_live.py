@@ -66,6 +66,23 @@ def copilot_spans(trace=TRACE_A):
     ]
 
 
+def copilot_otlp(spans):
+    """Wrap flat Copilot exporter spans in one OTLP/JSON resourceSpans payload."""
+    def attrs(values):
+        return [
+            {"key": key, "value": {"intValue": str(value)} if isinstance(value, int) else {"stringValue": value}}
+            for key, value in values.items()
+        ]
+    return {"resourceSpans": [{"resource": {"attributes": []}, "scopeSpans": [{"scope": {}, "spans": [
+        dict(
+            span, attributes=attrs(span["attributes"]),
+            startTimeUnixNano=str(span["startTimeUnixNano"]),
+            endTimeUnixNano=str(span["endTimeUnixNano"]),
+        )
+        for span in spans
+    ]}]}]}
+
+
 def live_canonical_doc(trace=TRACE_A):
     kind, _, documents, _ = bridge._parse_source_snapshot(
         json.dumps(copilot_spans(trace)).encode(), "copilot", live=True
@@ -387,6 +404,95 @@ class LiveAcknowledgmentTypeTests(unittest.TestCase):
         self.assertEqual(ledger.counts(self.conn)["imports"], 0)
 
     def test_live_true_still_accepted_for_claude_code(self):
+        with patch.object(bridge, "_deliver_document", return_value=CC_RESULT) as send:
+            result = deliver_snapshot(
+                self.conn, claude_code_raw(), "claude-code",
+                "http://127.0.0.1:8765", "fake-token", live=True,
+            )
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(result["mode"], "live")
+        self.assertEqual(ledger.counts(self.conn)["imports"], 1)
+
+
+class LiveDroppedRunTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = ledger.open_ledger(":memory:")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def assert_dropped_refused(self, raw, producer):
+        with patch.object(bridge, "_deliver_document") as send, \
+                patch.object(bridge, "import_bytes", wraps=bridge.import_bytes) as imported:
+            with self.assertRaises(BridgeError) as caught:
+                deliver_snapshot(
+                    self.conn, raw, producer, "http://127.0.0.1:8765",
+                    "fake-token", live=True,
+                )
+        self.assertIn("refused before import", str(caught.exception))
+        imported.assert_not_called()
+        send.assert_not_called()
+        self.assertEqual(ledger.counts(self.conn)["imports"], 0)
+        return str(caught.exception)
+
+    def test_copilot_duplicate_span_id_refused_before_import(self):
+        spans = copilot_spans()
+        spans[2]["spanId"] = CHILD
+        self.assert_dropped_refused(json.dumps(spans, sort_keys=True).encode(), "copilot")
+
+    def test_copilot_parent_cycle_refused_before_import(self):
+        spans = copilot_spans()
+        spans[0]["parentSpanId"] = CHILD
+        self.assert_dropped_refused(json.dumps(spans, sort_keys=True).encode(), "copilot")
+
+    def test_claude_code_duplicate_span_id_refused_before_import(self):
+        spans = claude_code_spans()
+        # hook.exec (...60008) takes the spanId of llm.call (...60002) in the same trace.
+        spans[2]["spanId"] = "a1b2c3d4e5f60002"
+        self.assert_dropped_refused(cc_mapping.serialize(spans), "claude-code")
+
+    def test_claude_code_parent_cycle_refused_before_import(self):
+        spans = claude_code_spans()
+        # agent.run (...60001) and llm.call (...60002) become each other's parent.
+        spans[0]["parentSpanId"] = "a1b2c3d4e5f60002"
+        self.assert_dropped_refused(cc_mapping.serialize(spans), "claude-code")
+
+    def test_refusal_does_not_echo_span_id(self):
+        spans = claude_code_spans()
+        spans[2]["spanId"] = "a1b2c3d4e5f60002"
+        message = self.assert_dropped_refused(cc_mapping.serialize(spans), "claude-code")
+        self.assertNotIn("a1b2c3d4e5f60002", message)
+
+    def test_copilot_otlp_duplicate_span_id_refused_before_import(self):
+        spans = copilot_spans()
+        spans[2]["spanId"] = CHILD
+        self.assert_dropped_refused(json.dumps(copilot_otlp(spans)).encode(), "copilot")
+
+    def test_copilot_jsonl_duplicate_span_id_refused_before_import(self):
+        spans = copilot_spans()
+        spans[2]["spanId"] = CHILD
+        raw = "\n".join(json.dumps(span, sort_keys=True) for span in spans).encode()
+        self.assert_dropped_refused(raw, "copilot")
+
+    def test_synthetic_delivery_of_duplicate_span_id_keeps_existing_behaviour(self):
+        # The strict check is live-only: synthetic delivery still imports
+        # (an invalid ledger row) and returns "rejected" without sending.
+        spans = copilot_spans()
+        spans[2]["spanId"] = CHILD
+        for span, name in zip(spans, ("agent.run", "llm.call", "tool.exec")):
+            span["name"] = name
+        spans[0]["attributes"].pop("gen_ai.system")
+        raw = json.dumps(spans, sort_keys=True).encode()
+        with patch.object(bridge, "_deliver_document", return_value=CC_RESULT) as send:
+            result = deliver_snapshot(
+                self.conn, raw, "copilot", "http://127.0.0.1:8765",
+                "fake-token", synthetic_only=True,
+            )
+        send.assert_not_called()
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertEqual(ledger.counts(self.conn)["imports"], 1)
+
+    def test_live_claude_code_clean_snapshot_still_delivered(self):
         with patch.object(bridge, "_deliver_document", return_value=CC_RESULT) as send:
             result = deliver_snapshot(
                 self.conn, claude_code_raw(), "claude-code",
