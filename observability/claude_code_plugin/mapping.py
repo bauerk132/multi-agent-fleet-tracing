@@ -52,6 +52,8 @@ What S5 adds, for kept spans only (dropped spans count nothing here):
   model: safe_model; count: safe_count; tool_name:
   safe_tool_name; text: safe_text). A passing value is emitted (counts become
   ints). A failing value is not emitted and is counted in unsafe_values.
+  S13: tool_name and text values are also refused above MAX_TOOL_VALUE_CHARS
+  (128) characters, counted the same way and never truncated.
 - Every other source attribute key is counted once: stripped_attributes when
   _vocab.is_stripped(key), otherwise unmapped_attributes. A key that is
   shadowed by an earlier source (for example tool_name after a present
@@ -187,6 +189,11 @@ KIND_BY_NAME = {
 # SQLite int64 (2**63 - 307 and above overflow there).
 MAX_TIME_NS = 2 ** 63 - 1_000_000
 
+# S13: keeps 10,000 worst-case tool spans under the bridge's 16 MiB canonical
+# limit (gen_ai.tool.name is written 3 times and gen_ai.tool.call.id twice).
+# The bridge's own limit stays 256.
+MAX_TOOL_VALUE_CHARS = 128
+
 COUNTER_KEYS = (
     "spans_in",
     "spans_out",
@@ -233,9 +240,13 @@ def _check_value(kind, value):
         count = _sanitize.safe_count(value)
         return _UNSAFE if count is None else count
     if kind == "tool_name":
-        return value if _sanitize.safe_tool_name(value) else _UNSAFE
+        if not _sanitize.safe_tool_name(value) or len(value) > MAX_TOOL_VALUE_CHARS:
+            return _UNSAFE
+        return value
     if kind == "text":
-        return value if _sanitize.safe_text(value) else _UNSAFE
+        if not _sanitize.safe_text(value) or len(value) > MAX_TOOL_VALUE_CHARS:
+            return _UNSAFE
+        return value
     return _UNSAFE
 
 

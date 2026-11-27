@@ -3279,6 +3279,94 @@ class Step3CycleBreakTests(unittest.TestCase):
         self.assertEqual(result["stats"]["spans"], len(spans))
 
 
+class Step3ToolValueCapTests(unittest.TestCase):
+    """M7-B step 3 S13: tool name and call id are capped at MAX_TOOL_VALUE_CHARS (128)."""
+
+    def test_max_tool_value_chars_is_128(self):
+        from claude_code_plugin import mapping
+        self.assertEqual(mapping.MAX_TOOL_VALUE_CHARS, 128)
+
+    def test_tool_name_128_kept_129_dropped(self):
+        ok_name = "N" + "a" * 127
+        spans, counters = _map_spans([_rec("claude_code.tool", span_id=_sid(1),
+                                           attributes={"tool_name": ok_name})])
+        self.assertEqual(spans[0]["attributes"]["gen_ai.tool.name"], ok_name)
+        self.assertEqual(counters["unsafe_values"], 0)
+
+        long_name = "N" + "a" * 128
+        spans, counters = _map_spans([_rec("claude_code.tool", span_id=_sid(2),
+                                           attributes={"tool_name": long_name})])
+        self.assertEqual(len(spans), 1)
+        self.assertNotIn("gen_ai.tool.name", spans[0]["attributes"])
+        self.assertEqual(counters["unsafe_values"], 1)
+
+    def test_tool_call_id_128_kept_129_dropped(self):
+        ok_id = "C" + "c" * 127
+        spans, counters = _map_spans([_rec("claude_code.tool", span_id=_sid(1),
+                                           attributes={"tool_use_id": ok_id})])
+        self.assertEqual(spans[0]["attributes"]["gen_ai.tool.call.id"], ok_id)
+        self.assertEqual(counters["unsafe_values"], 0)
+
+        long_id = "C" + "c" * 128
+        spans, counters = _map_spans([_rec("claude_code.tool", span_id=_sid(2),
+                                           attributes={"tool_use_id": long_id})])
+        self.assertEqual(len(spans), 1)
+        self.assertNotIn("gen_ai.tool.call.id", spans[0]["attributes"])
+        self.assertEqual(counters["unsafe_values"], 1)
+
+    def test_model_value_is_unaffected_by_tool_cap(self):
+        model = "m" * 256
+        spans, counters = _map_spans([_rec("claude_code.llm_request", span_id=_sid(1),
+                                           attributes={"gen_ai.request.model": model})])
+        self.assertEqual(spans[0]["attributes"]["gen_ai.request.model"], model)
+        self.assertEqual(counters["unsafe_values"], 0)
+
+    def test_refused_value_is_never_truncated_into_output(self):
+        marker = "T" * 129
+        spans, counters = _map_spans([
+            _rec("claude_code.tool", span_id=_sid(1), attributes={"tool_name": marker}),
+            _rec("claude_code.tool", span_id=_sid(2), attributes={"tool_use_id": marker}),
+        ])
+        self.assertEqual(counters["unsafe_values"], 2)
+        out = mapping_serialize_text(spans)
+        self.assertNotIn("T" * 128, out)
+        self.assertNotIn(marker, out)
+
+    def test_ten_thousand_worst_case_tool_spans_fit_the_bridge_limit(self):
+        from agentscope_importer import contract
+        from claude_code_plugin import mapping
+        name = "N" + "a" * 127
+        call_id = "C" + "c" * 127
+        session = "123e4567-e89b-12d3-a456-426614174000"
+        values = {"uuid": session, "tool_name": name, "text": call_id}
+        span_list = []
+        for number in range(1, 10_001):
+            attributes = {}
+            for _output_key, source_keys, kind in _vocab.ATTRIBUTE_SOURCES["claude_code.tool"]:
+                attributes[source_keys[0]] = values[kind]
+            parent = None if number == 1 else _sid(1)
+            span_list.append(_s8_span("claude_code.tool", _sid(number), parent=parent,
+                                      attributes=attributes))
+        line = _s8_line(span_list)
+        spans, counters = mapping.convert_lines([line])
+        self.assertEqual(counters["spans_out"], 10000)
+        self.assertEqual(counters["unsafe_values"], 0)
+        self.assertEqual(spans[0]["attributes"]["gen_ai.tool.name"], name)
+        self.assertEqual(spans[0]["attributes"]["gen_ai.tool.call.id"], call_id)
+
+        raw = mapping.serialize(spans)
+        bridge._parse_source_snapshot(raw, "claude-code")
+        documents = mapper.map_spans(json.loads(raw), "claude-code")["documents"]
+        self.assertEqual(len(documents), 1)
+        largest = max(len(mapper.canonical_bytes(doc)) for _key, doc in documents)
+        self.assertLess(largest, contract.MAX_BYTES_PER_IMPORT)
+
+
+def mapping_serialize_text(spans):
+    from claude_code_plugin import mapping
+    return mapping.serialize(spans).decode("ascii")
+
+
 class Step3TimestampBoundTests(unittest.TestCase):
     """M7-B step 3 S11: start/end times are kept only when an int in 0..MAX_TIME_NS."""
 
