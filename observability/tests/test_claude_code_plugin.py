@@ -898,6 +898,67 @@ class SurrogateWalkTests(unittest.TestCase):
         self.assertEqual(len(spans), 1)
 
 
+class Adj10P3Tests(unittest.TestCase):
+    # ADJ-R4-P3-01: a line whose shape is wrong is malformed before the
+    # surrogate walk runs, so the walk never pays for it.
+    # ADJ-R3-P3-01: the str path encodes each line at most once; the oversize
+    # decision reuses the size from the budget step.
+
+    def test_bad_shape_skips_surrogate_walk(self):
+        bad_shape = [r'["\ud800"]', r'{"a":"\ud800"}']
+        for text in bad_shape:
+            for kind in ("str", "bytes"):
+                with self.subTest(text=text, kind=kind):
+                    item = text if kind == "str" else text.encode("utf-8")
+                    with mock.patch.object(
+                        adapter_module, "_has_lone_surrogate",
+                        side_effect=AssertionError("surrogate walk must not run"),
+                    ) as walk:
+                        spans, counters = flatten_lines([item])
+                    self.assertEqual(walk.call_count, 0)
+                    self.assertEqual(spans, [])
+                    self.assertEqual(counters, {
+                        "lines_read": 1, "malformed_lines": 1, "spans": 0,
+                        "skipped_items": 0, "dropped_attributes": 0,
+                        "invalid_timestamps": 0, "spans_over_limit": 0,
+                        "stream_truncated": 0,
+                    })
+
+    def test_valid_shape_lone_surrogate_still_malformed(self):
+        # Unpatched: a correct resourceSpans line with a lone surrogate escape
+        # stays malformed, for str and bytes, and its good neighbour flattens.
+        escaped = _surrogate_line("attribute stringValue", "\ud800")
+        empty_rs = r'{"resourceSpans": [], "x": "\ud800"}'
+        for line in (escaped, empty_rs):
+            for kind in ("str", "bytes"):
+                with self.subTest(line=line[:40], kind=kind):
+                    item = line if kind == "str" else line.encode("utf-8")
+                    spans, counters = flatten_lines([item, _good_line()])
+                    self.assertEqual(counters["malformed_lines"], 1)
+                    self.assertEqual(counters["lines_read"], 2)
+                    self.assertEqual(len(spans), 1)
+
+    def test_str_path_encodes_once_no_text_oversize_call(self):
+        normal = _good_line()
+        limit = len(normal.encode("utf-8"))
+        oversize = _padded_line(limit + 1)
+        raw_lone = _good_with_extra_key('"pad": "\ud800"')
+        # _text_oversize is gone from the module; create=True keeps this a guard
+        # that fails if anyone reintroduces a second encode on the str path.
+        with mock.patch.object(
+            adapter_module, "_text_oversize", create=True,
+            side_effect=AssertionError("_text_oversize must not run on the str path"),
+        ) as spy, mock.patch.object(adapter_module, "MAX_LINE_BYTES", limit):
+            spans, counters = flatten_lines([normal, oversize, raw_lone])
+        self.assertEqual(spy.call_count, 0)
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(counters, {
+            "lines_read": 3, "malformed_lines": 2, "spans": 1, "skipped_items": 0,
+            "dropped_attributes": 0, "invalid_timestamps": 0, "spans_over_limit": 0,
+            "stream_truncated": 0,
+        })
+
+
 class AttributeDedupAndCapTests(unittest.TestCase):
     # Duplicate keys: first valid value wins, later duplicates are dropped and
     # counted. The cap counts only kept keys and applies after decoding.

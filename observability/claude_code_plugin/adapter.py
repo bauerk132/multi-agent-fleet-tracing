@@ -162,20 +162,6 @@ def _read_time(value, counters):
     return number
 
 
-def _text_oversize(text):
-    """True if the UTF-8 size of ``text`` is over ``MAX_LINE_BYTES``.
-
-    A str that cannot be encoded as UTF-8 (a lone surrogate) is treated as
-    oversize, so it is counted as malformed and never raises.
-    """
-    if len(text) > MAX_LINE_BYTES:
-        return True
-    try:
-        return len(text.encode("utf-8")) > MAX_LINE_BYTES
-    except UnicodeEncodeError:
-        return True
-
-
 def _has_lone_surrogate(text, payload):
     """True if a parsed line holds a surrogate that cannot be encoded as UTF-8.
 
@@ -210,15 +196,17 @@ def _has_lone_surrogate(text, payload):
 
 
 def _utf8_size(text):
-    """UTF-8 byte size of a str for budget charging. Never raises.
+    """Return ``(size, strict)`` for a str. Never raises.
 
-    A lone surrogate cannot be encoded as strict UTF-8, so it is sized with
-    ``surrogatepass``. The line itself is still malformed (see ``_text_oversize``).
+    ``size`` is the UTF-8 byte size, used for budget charging and the oversize
+    check. ``strict`` is False when the text cannot be encoded as strict UTF-8
+    (a lone surrogate). Such a text is sized with ``surrogatepass`` and the
+    line is malformed.
     """
     try:
-        return len(text.encode("utf-8"))
+        return len(text.encode("utf-8")), True
     except UnicodeEncodeError:
-        return len(text.encode("utf-8", "surrogatepass"))
+        return len(text.encode("utf-8", "surrogatepass")), False
 
 
 def flatten_lines(lines):
@@ -337,20 +325,25 @@ def flatten_lines(lines):
 
     for raw in lines:
         # Stream budget first: every item is charged, at least 1 byte, so an
-        # endless stream of empty or non-text items still ends.
+        # endless stream of empty or non-text items still ends. A str is encoded
+        # here once; its size and strict flag are reused for the oversize check.
+        strict = True
         if isinstance(raw, bytes):
             size = len(raw)
         elif isinstance(raw, str):
             # UTF-8 bytes are never fewer than chars, so a str longer than the
             # remaining budget is over without encoding it.
-            size = len(raw) if len(raw) > total_limit - used else _utf8_size(raw)
+            if len(raw) > total_limit - used:
+                size = len(raw)
+            else:
+                size, strict = _utf8_size(raw)
         else:
             size = 0
-        size = max(size, 1)
-        if used + size > total_limit:
+        charged = max(size, 1)
+        if used + charged > total_limit:
             counters["stream_truncated"] = 1
             break
-        used += size
+        used += charged
 
         if isinstance(raw, bytes):
             if len(raw) > MAX_LINE_BYTES:
@@ -364,7 +357,9 @@ def flatten_lines(lines):
                 counters["malformed_lines"] += 1
                 continue
         elif isinstance(raw, str):
-            if _text_oversize(raw):
+            # A lone surrogate (strict False) is malformed; otherwise the
+            # oversize check uses the UTF-8 size computed above.
+            if not strict or size > MAX_LINE_BYTES:
                 counters["lines_read"] += 1
                 counters["malformed_lines"] += 1
                 continue
@@ -385,10 +380,10 @@ def flatten_lines(lines):
         except (ValueError, TypeError, RecursionError):
             counters["malformed_lines"] += 1
             continue
-        if _has_lone_surrogate(text, payload):
+        if not isinstance(payload, dict) or not isinstance(payload.get("resourceSpans"), list):
             counters["malformed_lines"] += 1
             continue
-        if not isinstance(payload, dict) or not isinstance(payload.get("resourceSpans"), list):
+        if _has_lone_surrogate(text, payload):
             counters["malformed_lines"] += 1
             continue
 
