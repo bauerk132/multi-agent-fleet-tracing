@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.request
 from unittest.mock import patch
@@ -536,6 +537,38 @@ class ReceiverRefusalSummaryTests(unittest.TestCase):
             "stopped; received 0 spans in 0 payloads; refused 1 uploads "
             "(unsupported_content_type=1)",
         )
+
+    def test_summary_total_matches_reason_counts_during_concurrent_refusal(self):
+        # A refusal recorded while stop_summary() runs must not appear in the
+        # per-reason counts unless it is also in the total (G2-P2-01).
+        self._post(["Content-Type: application/x-protobuf"], b"\x00")
+        self.receiver._lock = _RefusalAfterFirstRelease(self.receiver)
+        self.assertEqual(
+            stop_summary(self.receiver),
+            "stopped; received 0 spans in 0 payloads; refused 1 uploads "
+            "(unsupported_content_type=1)",
+        )
+
+
+class _RefusalAfterFirstRelease:
+    """Lock stand-in that records one more refusal after its first release,
+    the way an upload refused on another thread would."""
+
+    def __init__(self, receiver):
+        self._inner = threading.Lock()
+        self._receiver = receiver
+        self._releases = 0
+
+    def __enter__(self):
+        self._inner.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._inner.release()
+        self._releases += 1
+        if self._releases == 1:
+            self._receiver.rejected.append({"reason": "invalid_json"})
+        return False
 
 
 class ReceiverCompatibilityTests(unittest.TestCase):

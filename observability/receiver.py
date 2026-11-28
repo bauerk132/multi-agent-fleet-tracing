@@ -131,11 +131,15 @@ class LocalReceiver:
         included. The record outlives stop(), so a caller can report it
         after shutdown.
         """
-        counts = {}
         with self._lock:
-            for record in self.rejected:
-                reason = record["reason"]
-                counts[reason] = counts.get(reason, 0) + 1
+            return self._rejection_counts_locked()
+
+    def _rejection_counts_locked(self):
+        # Caller must hold self._lock.
+        counts = {}
+        for record in self.rejected:
+            reason = record["reason"]
+            counts[reason] = counts.get(reason, 0) + 1
         return counts
 
     def _handle_payload(self, payload):
@@ -365,12 +369,14 @@ class LocalReceiver:
 
 def stop_summary(recv):
     """One shutdown line: accepted span/payload counts plus refusals by reason code."""
+    # One lock hold, so the refusal total and the per-reason counts agree
+    # even if uploads are still being refused on other threads.
     with recv._lock:
         n_spans = len(recv.spans)
         n_payloads = len(recv.payloads)
         n_refused = len(recv.rejected)
+        counts = recv._rejection_counts_locked()
     line = f"stopped; received {n_spans} spans in {n_payloads} payloads; refused {n_refused} uploads"
-    counts = recv.rejection_counts()
     if counts:
         line += " (" + ", ".join(f"{reason}={counts[reason]}" for reason in sorted(counts)) + ")"
     return line
