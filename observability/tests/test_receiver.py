@@ -10,7 +10,7 @@ import unittest
 import urllib.request
 from unittest.mock import patch
 
-from receiver import LocalReceiver
+from receiver import LocalReceiver, stop_summary
 
 
 def _receive_response(sock):
@@ -475,6 +475,67 @@ class ReceiverPrivacyTests(unittest.TestCase):
             health = json.loads(health_response.read().decode("utf-8"))
         self.assertEqual(health, {"status": "ok", "spans_received": 1, "payloads_received": 1})
         self.assertNotIn(marker, json.dumps(health))
+
+
+class ReceiverRefusalSummaryTests(unittest.TestCase):
+    def setUp(self):
+        self.receiver = LocalReceiver().start()
+
+    def tearDown(self):
+        self.receiver.stop()
+
+    def _post(self, headers, body):
+        sock = socket.create_connection(("127.0.0.1", self.receiver.port), timeout=2)
+        sock.settimeout(2)
+        try:
+            lines = ["POST /v1/traces HTTP/1.1", "Host: localhost"]
+            lines.extend(headers)
+            lines.append(f"Content-Length: {len(body)}")
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body)
+            return _receive_response(sock).split(b"\r\n", 1)[0]
+        finally:
+            sock.close()
+
+    def test_fresh_receiver_reports_zero_refusals(self):
+        self.assertEqual(self.receiver.rejection_counts(), {})
+        self.assertEqual(
+            stop_summary(self.receiver),
+            "stopped; received 0 spans in 0 payloads; refused 0 uploads",
+        )
+
+    def test_refusals_are_counted_by_reason_code_only(self):
+        marker = "SYNTHETIC-SUMMARY-662"
+        refused = (
+            (["Content-Type: application/x-protobuf; note=" + marker], b"\x00\x01"),
+            (["Content-Type: application/x-protobuf"], marker.encode("ascii")),
+            (["Content-Type: application/json"], ("{\"" + marker).encode("ascii")),
+        )
+        for headers, body in refused:
+            self.assertNotIn(b" 200 ", self._post(headers, body))
+        valid = json.dumps({"resourceSpans": [{"scopeSpans": [{"spans": [{"name": "s"}]}]}]}).encode()
+        self.assertIn(b" 200 ", self._post(["Content-Type: application/json"], valid))
+
+        counts = self.receiver.rejection_counts()
+        self.assertEqual(counts, {"invalid_json": 1, "unsupported_content_type": 2})
+        counts["invalid_json"] = 99
+        self.assertEqual(self.receiver.rejection_counts()["invalid_json"], 1)
+
+        summary = stop_summary(self.receiver)
+        self.assertEqual(
+            summary,
+            "stopped; received 1 spans in 1 payloads; refused 3 uploads "
+            "(invalid_json=1, unsupported_content_type=2)",
+        )
+        self.assertNotIn(marker, summary)
+
+    def test_summary_survives_stop(self):
+        self._post(["Content-Type: application/x-protobuf"], b"\x00")
+        self.receiver.stop()
+        self.assertEqual(
+            stop_summary(self.receiver),
+            "stopped; received 0 spans in 0 payloads; refused 1 uploads "
+            "(unsupported_content_type=1)",
+        )
 
 
 class ReceiverCompatibilityTests(unittest.TestCase):

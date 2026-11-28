@@ -124,6 +124,20 @@ class LocalReceiver:
         display_host = f"[{self.host}]" if ":" in self.host else self.host
         return f"http://{display_host}:{self.port}/v1/traces"
 
+    def rejection_counts(self):
+        """Return a new {reason_code: count} dict of refused uploads so far.
+
+        Only the fixed reason codes are counted; no request metadata is
+        included. The record outlives stop(), so a caller can report it
+        after shutdown.
+        """
+        counts = {}
+        with self._lock:
+            for record in self.rejected:
+                reason = record["reason"]
+                counts[reason] = counts.get(reason, 0) + 1
+        return counts
+
     def _handle_payload(self, payload):
         with self._lock:
             flattened = flatten_payload(payload)
@@ -349,6 +363,19 @@ class LocalReceiver:
             self._thread = None
 
 
+def stop_summary(recv):
+    """One shutdown line: accepted span/payload counts plus refusals by reason code."""
+    with recv._lock:
+        n_spans = len(recv.spans)
+        n_payloads = len(recv.payloads)
+        n_refused = len(recv.rejected)
+    line = f"stopped; received {n_spans} spans in {n_payloads} payloads; refused {n_refused} uploads"
+    counts = recv.rejection_counts()
+    if counts:
+        line += " (" + ", ".join(f"{reason}={counts[reason]}" for reason in sorted(counts)) + ")"
+    return line
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -371,4 +398,4 @@ if __name__ == "__main__":
         pass
     finally:
         recv.stop()
-        print(f"stopped; received {len(recv.spans)} spans in {len(recv.payloads)} payloads")
+        print(stop_summary(recv))
