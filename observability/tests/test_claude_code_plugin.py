@@ -3970,6 +3970,27 @@ class Step4EnvCliTests(unittest.TestCase):
                 self.assertEqual(stderr.getvalue(), "error: invalid env arguments\n")
                 self.assertNotIn(marker, stderr.getvalue())
 
+    def test_env_usage_errors_with_flags_before_subcommand_do_not_reflect_values(self):
+        from claude_code_plugin import cli
+
+        marker = "SYNTHETIC-PREFIX-709"
+        endpoint = "http://127.0.0.1:4318/v1/traces"
+        for argv in (
+            ["--unknown", marker, "env"],
+            ["--unknown", marker, "env", "--endpoint", endpoint],
+            ["-x", marker, "env", "--endpoint", endpoint, "--bad", marker],
+            [marker, "env", "--endpoint", endpoint],
+        ):
+            with self.subTest(argv=argv):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    code = cli.main(argv)
+                self.assertEqual(code, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "error: invalid env arguments\n")
+                self.assertNotIn(marker, stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

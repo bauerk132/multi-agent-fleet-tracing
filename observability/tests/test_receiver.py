@@ -114,6 +114,45 @@ class ReceiverBodyBoundsTests(unittest.TestCase):
             self.assertIn(b" 400 ", response)
         finally:
             sock.close()
+        self.assertEqual(self.receiver.rejected[-1], {
+            "content_type": "application/json",
+            "length": 5,
+            "encoding": None,
+            "reason": "incomplete_body",
+        })
+
+    def test_framing_refusals_record_exact_reason_and_length_metadata(self):
+        json_type = "Content-Type: application/json"
+        cases = (
+            ("missing length", [json_type], 411, "length_required", None),
+            ("transfer encoding", [json_type, "Transfer-Encoding: chunked"],
+             411, "unsupported_transfer_encoding", None),
+            ("repeated length", [json_type, "Content-Length: 2", "Content-Length: 2"],
+             411, "invalid_length", None),
+            ("oversize int", [json_type, "Content-Length: 16777217"],
+             413, "body_too_large", 16777217),
+            ("oversize huge", [json_type, "Content-Length: " + "9" * 400],
+             413, "body_too_large", "over_range"),
+        )
+        for name, headers, status_code, reason, length in cases:
+            with self.subTest(name=name):
+                status = self._post_headers(headers)
+                self.assertIn(f" {status_code} ".encode("ascii"), status)
+                self.assertEqual(self.receiver.rejected[-1], {
+                    "content_type": "application/json",
+                    "length": length,
+                    "encoding": None,
+                    "reason": reason,
+                })
+
+    def test_padded_content_length_is_accepted_and_reaches_validation(self):
+        for value in (" 2", "2 ", " \t2\t "):
+            with self.subTest(value=value):
+                status = self._post_request(
+                    ["Content-Type: application/json", f"Content-Length:{value}"], b"{}"
+                )
+                self.assertIn(b" 400 ", status)
+                self.assertEqual(self.receiver.rejected[-1]["reason"], "invalid_payload")
 
     def test_zero_length_reaches_json_validation(self):
         status = self._post_headers([

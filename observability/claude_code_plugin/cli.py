@@ -89,7 +89,7 @@ class _Subparser(argparse.ArgumentParser):
 class _MainParser(_Subparser):
     def parse_args(self, args=None, namespace=None):
         values = list(sys.argv[1:] if args is None else args)
-        self.env_mode = bool(values and values[0] == "env")
+        self.env_mode = "env" in values
         return super().parse_args(values, namespace)
 
     def error(self, message):
